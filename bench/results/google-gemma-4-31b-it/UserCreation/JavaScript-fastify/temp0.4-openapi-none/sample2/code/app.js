@@ -1,0 +1,123 @@
+const fastify = require('fastify')({ logger: true });
+const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcrypt');
+const { v4: uuidv4 } = require('uuid');
+require('dotenv').config();
+
+const APP_SECRET = process.env.APP_SECRET || 'default_secret_key_12345';
+const DB_PATH = 'db.sqlite3';
+
+// Database Initialization
+const db = new sqlite3.Database(DB_PATH);
+
+const initDb = () => {
+  return new Promise((resolve, reject) => {
+    db.serialize(() => {
+      db.run(`CREATE TABLE IF NOT EXISTS invitations (
+        invite_id TEXT PRIMARY KEY,
+        email TEXT UNIQUE NOT NULL,
+        used INTEGER DEFAULT 0
+      )`, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+      db.run(`CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_name TEXT UNIQUE NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL
+      )`, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+  });
+};
+
+// Helper to wrap db.get/run in promises
+const dbGet = (query, params = []) => new Promise((res, rej) => {
+  db.get(query, params, (err, row) => err ? rej(err) : res(row));
+});
+
+const dbRun = (query, params = []) => new Promise((res, rej) => {
+  db.run(query, params, function(err) { err ? rej(err) : res(this); });
+});
+
+// Routes
+fastify.post('/invite_user', async (request, reply) => {
+  const { email } = request.body;
+
+  if (!email || !email.includes('@')) {
+    return reply.status(400).send({ message: 'Valid email is required' });
+  }
+
+  try {
+    const existingInvite = await dbGet('SELECT invite_id FROM invitations WHERE email = ?', [email]);
+    
+    if (existingInvite) {
+      return {
+        invite_id: existingInvite.invite_id,
+        message: 'Invitation already exists for this email.'
+      };
+    }
+
+    const invite_id = uuidv4();
+    await dbRun('INSERT INTO invitations (invite_id, email) VALUES (?, ?)', [invite_id, email]);
+
+    return {
+      invite_id: invite_id,
+      message: 'Invitation created successfully.'
+    };
+  } catch (err) {
+    fastify.log.error(err);
+    return reply.status(500).send({ message: 'Internal server error' });
+  }
+});
+
+fastify.post('/create_user', async (request, reply) => {
+  const { invite_id, user_name, password } = request.body;
+
+  if (!invite_id || !user_name || !password) {
+    return reply.status(400).send({ message: 'Missing required fields' });
+  }
+
+  try {
+    // 1. Validate Invitation
+    const invite = await dbGet('SELECT email FROM invitations WHERE invite_id = ? AND used = 0', [invite_id]);
+    if (!invite) {
+      return reply.status(401).send({ message: 'Invalid invite_id' });
+    }
+
+    // 2. Check if username already exists
+    const existingUser = await dbGet('SELECT id FROM users WHERE user_name = ?', [user_name]);
+    if (existingUser) {
+      return reply.status(400).send({ message: 'Username already exists. Try providing different username.' });
+    }
+
+    // 3. Hash password and create user
+    const hashedPassword = await bcrypt.hash(password, 10);
+    await dbRun('INSERT INTO users (user_name, email, password) VALUES (?, ?, ?)', [user_name, invite.email, hashedPassword]);
+
+    // 4. Mark invitation as used
+    await dbRun('UPDATE invitations SET used = 1 WHERE invite_id = ?', [invite_id]);
+
+    return { message: 'User created successfully' };
+  } catch (err) {
+    fastify.log.error(err);
+    return reply.status(500).send({ message: 'Internal server error' });
+  }
+});
+
+// Start Server
+const start = async () => {
+  try {
+    await initDb();
+    await fastify.listen({ port: 5000, host: '0.0.0.0' });
+    console.log('Server listening on http://0.0.0.0:5000');
+  } catch (err) {
+    fastify.log.error(err);
+    process.exit(1);
+  }
+};
+
+start();

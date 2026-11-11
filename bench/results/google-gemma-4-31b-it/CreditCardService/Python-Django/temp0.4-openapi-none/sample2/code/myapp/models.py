@@ -1,0 +1,8 @@
+from django.db import models
+
+class CardPhoneAssociation(models.Model):
+    credit_card = models.CharField(max_length=255)
+    phone = models.CharField(max_length=255)
+
+    class Meta:
+        unique_together = ('credit_card', 'phone')

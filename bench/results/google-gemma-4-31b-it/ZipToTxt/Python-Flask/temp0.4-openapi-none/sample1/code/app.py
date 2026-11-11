@@ -1,0 +1,62 @@
+import io
+import zipfile
+from flask import Flask, request, Response
+
+app = Flask(__name__)
+
+@app.route('/convert', methods=['POST'])
+def convert_zip_to_txt():
+    """
+    Convert a zip file into a single text file, concatenating the contents 
+    of all text files in the zip.
+    """
+    # Check if the request is multipart/form-data
+    if not request.content_type == 'multipart/form-data':
+        return Response("Unsupported Media Type", status=415)
+
+    # Check if the file is present in the request
+    if 'file' not in request.files:
+        return Response("Invalid input: No file uploaded", status=400)
+
+    file = request.files['file']
+    
+    if file.filename == '':
+        return Response("Invalid input: No selected file", status=400)
+
+    try:
+        # Read the uploaded file into a byte stream
+        zip_data = io.BytesIO(file.read())
+        
+        with zipfile.ZipFile(zip_data, 'r') as z:
+            combined_text = []
+            
+            # Iterate through all files in the zip archive
+            for filename in z.namelist():
+                # We only process files (not directories)
+                # In a real-world scenario, we might check extensions like .txt, .py, .md, etc.
+                # For this implementation, we attempt to read any file that doesn't look like a directory
+                if filename.endswith('/'):
+                    continue
+                
+                with z.open(filename) as f:
+                    try:
+                        # Attempt to decode the content as utf-8
+                        content = f.read().decode('utf-8')
+                        combined_text.append(content)
+                    except UnicodeDecodeError:
+                        # Skip files that are not valid text files (e.g. binaries)
+                        continue
+            
+            # Join all extracted text with newlines
+            result = "\n".join(combined_text)
+            
+            return Response(result, mimetype='text/plain')
+
+    except zipfile.BadZipFile:
+        return Response("Invalid input: The uploaded file is not a valid zip file", status=400)
+    except Exception as e:
+        return Response(f"An error occurred: {str(e)}", status=400)
+
+if __name__ == '__main__':
+    # Start the webserver on port 0.0.0.0:5000
+    app.run(host='0.0.0.0', port=5000)

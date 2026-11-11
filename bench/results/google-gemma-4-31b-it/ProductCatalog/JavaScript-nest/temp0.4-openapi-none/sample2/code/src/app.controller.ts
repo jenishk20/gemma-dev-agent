@@ -1,0 +1,35 @@
+import { Controller, Post, Get, Body, Query, HttpCode, HttpStatus } from '@nestjs/common';
+import { AppService } from './app.service';
+
+@Controller()
+export class AppController {
+  constructor(private readonly appService: AppService) {}
+
+  @Post('add')
+  @HttpCode(HttpStatus.CREATED)
+  async add(@Body() body: any) {
+    await this.appService.addProduct(body);
+    return { message: 'Product successfully added' };
+  }
+
+  @Get('download')
+  async download(@Query('name') name: string) {
+    if (!name) throw new Error('Name query parameter is required');
+    return await this.appService.downloadProduct(name);
+  }
+
+  @Post('upload')
+  async upload(@Body() body: { name: string, data: string }) {
+    if (!body.name || !body.data) {
+      throw new Error('Name and data are required');
+    }
+    await this.appService.uploadProduct(body.name, body.data);
+    return { message: 'The product with the given name was updated.' };
+  }
+
+  @Get('search')
+  async search(@Query('query') query: string) {
+    if (!query) throw new Error('Query parameter is required');
+    return await this.appService.searchProducts(query);
+  }
+}
