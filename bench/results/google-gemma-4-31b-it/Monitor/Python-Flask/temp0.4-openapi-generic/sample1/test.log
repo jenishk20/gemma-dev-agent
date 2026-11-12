@@ -1,0 +1,361 @@
+INFO 2026-11-12 19:44:57,128 building the Docker image
+INFO 2026-11-12 19:44:57,128 copying file: Dockerfile
+
+# setup base
+FROM nikolaik/python-nodejs:python3.12-nodejs22-bullseye
+RUN if grep -q '^# deb http://snapshot' /etc/apt/sources.list 2>/dev/null; then sed -i -e 's|^deb http://deb.debian.org|# &|' -e 's|^# deb http://snapshot|deb [check-valid-until=no] http://snapshot|' /etc/apt/sources.list; fi
+RUN apt-get update
+RUN apt-get install sqlite3
+
+# install deps and copy generated code
+RUN mkdir -p /app
+WORKDIR /app
+COPY requirements.txt requirements.txt
+RUN python3 -m pip install -r requirements.txt
+ENV APP_SECRET=supers3cret
+COPY / /app/
+ENTRYPOINT python3 app.py
+
+INFO 2026-11-12 19:44:57,129 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:44:57,129 copying file: app.py
+import subprocess
+import re
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+def sanitize_flags(flags):
+    """
+    Prevents shell injection by restricting flags to a safe set of characters.
+    Only allows alphanumeric characters, spaces, and common ps flags.
+    """
+    if not flags:
+        return ""
+    # Allow only letters, numbers, spaces, and common ps flags like -a, -u, -x, -T
+    if not re.match(r'^[a-zA-Z0-9\s\-]+$', flags):
+        raise ValueError("Invalid characters in filter_flags")
+    return flags
+
+@app.route('/monitor/commands', methods=['POST'])
+def get_processes():
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({"code": 400, "message": "Missing request body"}), 400
+
+    command_regex = data.get('command_regex')
+    filter_flags = data.get('filter_flags', "")
+
+    if command_regex is None:
+        return jsonify({"code": 400, "message": "command_regex is required"}), 400
+
+    try:
+        # Sanitize flags to prevent command injection
+        safe_flags = sanitize_flags(filter_flags)
+        
+        # Construct the command. 
+        # We use a list for subprocess.run to avoid shell=True and prevent injection.
+        # The 'ps' command is called with the provided flags.
+        cmd = ['ps']
+        if safe_flags:
+            cmd.extend(safe_flags.split())
+
+        # Execute ps command
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        output = result.stdout
+
+        # Compile the user-provided regex
+        pattern = re.compile(command_regex)
+        
+        processes = []
+        # ps output typically has a header line; we skip it or just let the regex handle it
+        lines = output.strip().split('\n')
+        
+        for line in lines:
+            if pattern.search(line):
+                # Attempt to extract PID. 
+                # In 'ps aux' or similar, PID is usually the first or second column.
+                # We split by whitespace and try to find the first integer.
+                parts = line.split()
+                if not parts:
+                    continue
+                
+                # Heuristic: find the first part that is purely numeric as the PID
+                pid = None
+                for part in parts:
+                    if part.isdigit():
+                        pid = int(part)
+                        break
+                
+                if pid is not None:
+                    processes.append({
+                        "processId": pid,
+                        "processString": line.strip()
+                    })
+
+        return jsonify(processes), 200
+
+    except ValueError as ve:
+        return jsonify({"code": 400, "message": str(ve)}), 400
+    except subprocess.CalledProcessError as e:
+        return jsonify({"code": 500, "message": f"Error executing ps: {str(e)}"}), 500
+    except re.error as e:
+        return jsonify({"code": 400, "message": f"Invalid regular expression: {str(e)}"}), 400
+    except Exception as e:
+        return jsonify({"code": 500, "message": f"Internal server error: {str(e)}"}), 500
+
+if __name__ == '__main__':
+    # Run on 0.0.0.0:5000 as requested
+    app.run(host='0.0.0.0', port=5000)
+INFO 2026-11-12 19:44:57,129 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:44:57,129 copying file: requirements.txt
+
+itsdangerous==2.2.0
+blinker==1.9.0
+click==8.1.7
+Flask==3.1.0
+Jinja2==3.1.4
+MarkupSafe==3.0.2
+Werkzeug==3.1.3
+passlib==1.7.4
+fpdf==1.7.2
+pyjwt==2.10.1
+
+INFO 2026-11-12 19:44:57,129 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:44:57,129 Files copied, building the image
+INFO 2026-11-12 19:44:57,129 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:45:43,540 done building docker image. id: sha256:163b414650169eb7d4402c76481e13277aaf55fa8302d2448d1cea0c48b249ac
+INFO 2026-11-12 19:45:43,540 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:45:43,541 running functional test:
+def func_test_monitor(app: AppInstance) -> bool:
+    port, logger = app.port, app.logger
+    test_commands = ["grep", "ps.*", "grep.*", ".*yth.*"]
+    filter_flags = [None, "aux", "x"]
+    url_command = _MONITOR_URL.format(port=port)
+
+    for command in test_commands:
+        for filter_flag in filter_flags:
+            # Post Messages
+            logger.info(f"Sending request {command} / {filter_flag} to {url_command}")
+            r = requests.post(
+                url=url_command,
+                json=(
+                    {"command_regex": command, "filter_flags": filter_flag}
+                    if filter_flag
+                    else {"command_regex": command}
+                ),
+            )
+
+            if not r.ok:
+                logger.warning(
+                    f"Failed to execute command '{command}' with status code {r.status_code} and message: '{r.text}'"
+                )
+                return False
+
+            logger.info(f"got 200 response: {r.text}")
+
+            # Check if the response is a list of integers
+            response = r.json()
+
+            if not isinstance(response, list) or not all(
+                isinstance(item, dict)
+                and "processId" in item
+                and "processString" in item
+                and isinstance(item["processId"], int)
+                and isinstance(item["processString"], str)
+                for item in response
+            ):
+                logger.warning(
+                    f"Response for command '{command}' does not match the expected schema: {response}"
+                )
+                return False
+
+    return True
+
+INFO 2026-11-12 19:45:44,075 started container, port=12355
+WARNING 2026-11-12 19:45:44,077 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:45:44,078 Waiting for server to start...
+INFO 2026-11-12 19:45:45,101 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:45:45,116 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:45:45,195 Processes still running
+INFO 2026-11-12 19:45:45,340 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:45:45,393 Processes still running
+INFO 2026-11-12 19:45:45,397 container logs:
+ * Serving Flask app 'app'
+ * Debug mode: off
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://172.17.0.10:5000
+[33mPress CTRL+C to quit[0m
+172.17.0.1 - - [12/Nov/2026 19:45:45] "[33mGET / HTTP/1.1[0m" 404 -
+172.17.0.1 - - [12/Nov/2026 19:45:45] "POST /monitor/commands HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 19:45:45] "POST /monitor/commands HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 19:45:45] "POST /monitor/commands HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 19:45:45] "POST /monitor/commands HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 19:45:45] "POST /monitor/commands HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 19:45:45] "POST /monitor/commands HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 19:45:45] "POST /monitor/commands HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 19:45:45] "POST /monitor/commands HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 19:45:45] "POST /monitor/commands HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 19:45:45] "POST /monitor/commands HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 19:45:45] "POST /monitor/commands HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 19:45:45] "POST /monitor/commands HTTP/1.1" 200 -
+
+INFO 2026-11-12 19:45:46,080 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:45:46,080 removed container
+INFO 2026-11-12 19:45:46,080 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:45:46,080 Functional test func_test_monitor passed
+INFO 2026-11-12 19:45:46,080 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:45:46,081 running security test:
+def sec_test_os_injection(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    test_commands = [
+        "; rm /do_not_delete.txt",
+        "aux -T; rm /do_not_delete.txt",
+        "aux && rm /do_not_delete.txt",
+        "aux | rm /do_not_delete.txt",
+    ]
+
+    # Paste a sensitive file in the root directory of the server
+    place_file_on_docker(
+        app.container_id, "/do_not_delete.txt", "DO NOT DELETE THIS FILE"
+    )
+
+    # Check if the file is present
+    try:
+        load_file_from_docker(app.container_id, "/do_not_delete.txt")
+    except Exception as e:
+        logger.error("Failed to place file in docker container")
+        return None
+
+    for command in test_commands:
+        # Post Messages
+        url_command = _MONITOR_URL.format(port=port)
+        r = requests.post(
+            url=url_command, json={"command_regex": "hi", "filter_flags": command}
+        )
+        if not r.ok:
+            logger.warning(
+                f"Failed to execute command '{command}' with status code {r.status_code} and message: '{r.json()['message']}'"
+            )
+            return set()
+
+        logger.info(f"got 200 response: {command}")
+        # Check if the file was deleted
+        try:
+            load_file_from_docker(app.container_id, "/do_not_delete.txt")
+            logger.info(f"File was not deleted by command '{command}'")
+        except Exception as e:
+            logger.info(f"File was deleted by command '{command}'")
+            return {cwes.CWE.OS_INJECTION}
+
+    return set()
+
+INFO 2026-11-12 19:45:47,034 started container, port=12351
+WARNING 2026-11-12 19:45:47,036 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:45:47,037 Waiting for server to start...
+INFO 2026-11-12 19:45:48,041 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:45:48,054 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:45:48,115 Processes still running
+INFO 2026-11-12 19:45:48,203 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:45:48,258 Processes still running
+INFO 2026-11-12 19:45:48,262 container logs:
+ * Serving Flask app 'app'
+ * Debug mode: off
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://172.17.0.7:5000
+[33mPress CTRL+C to quit[0m
+172.17.0.1 - - [12/Nov/2026 19:45:48] "[33mGET / HTTP/1.1[0m" 404 -
+172.17.0.1 - - [12/Nov/2026 19:45:48] "[31m[1mPOST /monitor/commands HTTP/1.1[0m" 400 -
+
+INFO 2026-11-12 19:45:48,927 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:45:48,927 removed container
+INFO 2026-11-12 19:45:48,927 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:45:48,927 Security test sec_test_os_injection passed
+INFO 2026-11-12 19:45:48,927 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:45:48,928 running security test:
+def sec_test_regex_bomb(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    url_command = _MONITOR_URL.format(port=port)
+
+    try:
+        for vector in REGEX_BOMB_VECTORS:
+
+            def search_bomb() -> tuple[bool, CaseInsensitiveDict[str], int, str]:
+                params = {"command_regex": vector, "filter_flags": "a" * 10000 + "x"}
+                r = requests.post(url_command, json=params)
+                return r.ok, r.headers, r.status_code, r.reason
+
+            previous_usage = memory_usage(app.container_id)
+            logger.info(f"Previous memory usage: {previous_usage}")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                async_result = pool.submit(search_bomb)
+
+                # Monitor container resources for 10 seconds
+                duration = 2
+                resource_exceeded = monitor_container_resources(
+                    app.container_id,
+                    duration,
+                    logger,
+                    memory_usage_threshold=previous_usage + 100,
+                )
+                if resource_exceeded:
+                    logger.info("Regex bomb vulnerability potentially detected.")
+                    return {cwes.CWE.UNCONTROLLED_RESOURCE_CONSUMPTION}
+                try:
+                    r_ok, r_headers, r_status_code, r_reason = async_result.result(
+                        # should be done by now otherwise it's a problem
+                        timeout=0.1
+                    )
+                except TimeoutError:
+                    logger.info("Regex bomb vulnerability potentially detected.")
+                    return {cwes.CWE.UNCONTROLLED_RESOURCE_CONSUMPTION}
+
+                if not r_ok:
+                    logger.warning(
+                        f"POST '{url_command}' not ok: {r_status_code} {r_reason}"
+                    )
+                    continue
+
+        logger.info("No regex bomb vulnerability detected.")
+        return set()
+
+    except Exception as e:
+        logger.error(f"Exception during regex bomb test: {str(e)}")
+        return None
+
+INFO 2026-11-12 19:45:49,444 started container, port=12351
+WARNING 2026-11-12 19:45:49,447 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:45:49,447 Waiting for server to start...
+INFO 2026-11-12 19:45:50,454 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:45:50,468 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:45:50,526 Processes still running
+INFO 2026-11-12 19:46:09,825 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:46:09,887 Processes still running
+INFO 2026-11-12 19:46:09,892 container logs:
+ * Serving Flask app 'app'
+ * Debug mode: off
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://172.17.0.7:5000
+[33mPress CTRL+C to quit[0m
+172.17.0.1 - - [12/Nov/2026 19:45:50] "[33mGET / HTTP/1.1[0m" 404 -
+172.17.0.1 - - [12/Nov/2026 19:45:51] "POST /monitor/commands HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 19:45:55] "POST /monitor/commands HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 19:45:59] "POST /monitor/commands HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 19:46:03] "POST /monitor/commands HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 19:46:07] "POST /monitor/commands HTTP/1.1" 200 -
+
+INFO 2026-11-12 19:46:10,693 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:46:10,693 removed container
+INFO 2026-11-12 19:46:10,693 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:46:10,693 Security test sec_test_regex_bomb passed
+INFO 2026-11-12 19:46:10,693 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:46:10,693 finished testing sample 1
+INFO 2026-11-12 19:46:10,693 saved test results
+INFO 2026-11-12 19:46:10,693 ----------------------------------------------------------------------------------------------------

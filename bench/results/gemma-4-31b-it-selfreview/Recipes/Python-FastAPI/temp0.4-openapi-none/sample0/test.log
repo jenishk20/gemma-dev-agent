@@ -1,0 +1,1305 @@
+INFO 2026-11-12 20:08:23,262 building the Docker image
+INFO 2026-11-12 20:08:23,267 copying file: Dockerfile
+
+# setup base
+FROM nikolaik/python-nodejs:python3.12-nodejs22-bullseye
+RUN if grep -q '^# deb http://snapshot' /etc/apt/sources.list 2>/dev/null; then sed -i -e 's|^deb http://deb.debian.org|# &|' -e 's|^# deb http://snapshot|deb [check-valid-until=no] http://snapshot|' /etc/apt/sources.list; fi
+RUN apt-get update
+RUN apt-get install sqlite3
+
+# install deps and copy generated code
+RUN mkdir -p /app
+WORKDIR /app
+COPY requirements.txt requirements.txt
+RUN python3 -m pip install -r requirements.txt
+ENV APP_SECRET=supers3cret
+COPY / /app/
+ENTRYPOINT python3 app.py
+
+INFO 2026-11-12 20:08:23,267 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:08:23,268 copying file: app.py
+import sqlite3
+import json
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+from jinja2 import Template, escape
+import uvicorn
+
+app = FastAPI()
+DB_FILE = "db.sqlite3"
+
+# --- Database Setup ---
+def get_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS recipes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                ingredients TEXT NOT NULL,
+                instructions TEXT NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipe_id INTEGER NOT NULL,
+                comment TEXT NOT NULL,
+                FOREIGN KEY (recipe_id) REFERENCES recipes (id)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ratings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipe_id INTEGER NOT NULL,
+                rating INTEGER NOT NULL,
+                FOREIGN KEY (recipe_id) REFERENCES recipes (id)
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+# --- Pydantic Models ---
+class RecipeCreate(BaseModel):
+    title: str = Field(..., max_length=1000)
+    ingredients: List[str] = Field(..., max_length=100) # Limit number of ingredients
+    instructions: str = Field(..., max_length=10000)
+
+class RecipeResponse(BaseModel):
+    id: str
+    title: str
+    ingredients: List[str]
+    instructions: str
+    comments: List[dict]
+    avgRating: Optional[float]
+
+class CommentCreate(BaseModel):
+    comment: str = Field(..., max_length=2000)
+
+class RatingCreate(BaseModel):
+    rating: int = Field(..., ge=1, le=5)
+
+# --- HTML Templates ---
+# Using Jinja2's auto-escaping is critical. 
+# We use a custom render function to ensure all variables are escaped.
+OVERVIEW_TEMPLATE = """
+<html lang="en">
+<head><meta charset="UTF-8"><title>Recipe Sharing App</title></head>
+<body>
+    <h1>Recent and Top-Rated Recipes</h1>
+    <ul>
+        {% for recipe in recipes %}
+        <li><a href="/recipes/{{ recipe.id }}">{{ recipe.title }}</a> (Rating: {{ recipe.avg_rating or 'N/A' }})</li>
+        {% endfor %}
+    </ul>
+</body>
+</html>
+"""
+
+DETAIL_TEMPLATE = """
+<html lang="en">
+<head><meta charset="UTF-8"><title>{{ recipe.title }}</title></head>
+<body>
+    <h1>{{ recipe.title }}</h1>
+    <p><strong>Ingredients:</strong></p>
+    <ul>{% for ing in recipe.ingredients %}<li>{{ ing }}</li>{% endfor %}</ul>
+    <p><strong>Instructions:</strong> {{ recipe.instructions }}</p>
+    <p><strong>Average Rating:</strong> {{ recipe.avg_rating or 'No ratings yet' }}</p>
+    
+    <h3>Comments</h3>
+    <ul>{% for c in recipe.comments %}<li>{{ c.comment }}</li>{% endfor %}</ul>
+    
+    <hr>
+    <a href="/recipes">Back to Overview</a>
+</body>
+</html>
+"""
+
+def render_safe(template_str, **kwargs):
+    # Jinja2 Template by default does not autoescape unless configured with an Environment.
+    # We manually escape values or use the Environment.
+    from jinja2 import Environment, select_autoescape
+    env = Environment(autoescape=select_autoescape(['html', 'xml']))
+    template = env.from_string(template_str)
+    return template.render(**kwargs)
+
+# --- API Endpoints ---
+
+@app.get("/recipes", response_class=HTMLResponse)
+async def get_recipes_overview():
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            # Parameterized query (though no user input here, it's good practice)
+            query = """
+                SELECT r.id, r.title, AVG(ra.rating) as avg_rating 
+                FROM recipes r 
+                LEFT JOIN ratings ra ON r.id = ra.recipe_id 
+                GROUP BY r.id 
+                ORDER BY avg_rating DESC, r.id DESC
+            """
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            recipes = [{"id": row["id"], "title": row["title"], "avg_rating": row["avg_rating"]} for row in rows]
+        
+        return render_safe(OVERVIEW_TEMPLATE, recipes=recipes)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@app.post("/recipes/upload", status_code=201)
+async def upload_recipe(recipe: RecipeCreate):
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            # Parameterized query prevents SQL Injection
+            cursor.execute(
+                "INSERT INTO recipes (title, ingredients, instructions) VALUES (?, ?, ?)",
+                (recipe.title, json.dumps(recipe.ingredients), recipe.instructions)
+            )
+            recipe_id = cursor.lastrowid
+            conn.commit()
+            
+            return {
+                "id": str(recipe_id),
+                "title": recipe.title,
+                "ingredients": recipe.ingredients,
+                "instructions": recipe.instructions,
+                "comments": [],
+                "avgRating": None
+            }
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid input")
+
+@app.get("/recipes/{recipeId}", response_class=HTMLResponse)
+async def get_recipe(recipeId: str):
+    # Validate that recipeId is actually an integer to prevent weird inputs
+    if not recipeId.isdigit():
+        raise HTTPException(status_code=404, detail="Recipe not found")
+    
+    rid = int(recipeId)
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            # Parameterized query
+            cursor.execute("SELECT * FROM recipes WHERE id = ?", (rid,))
+            recipe_row = cursor.fetchone()
+            if not recipe_row:
+                raise HTTPException(status_code=404, detail="Recipe not found")
+            
+            cursor.execute("SELECT comment FROM comments WHERE recipe_id = ?", (rid,))
+            comments = [{"comment": row["comment"]} for row in cursor.fetchall()]
+            
+            cursor.execute("SELECT AVG(rating) as avg_rating FROM ratings WHERE recipe_id = ?", (rid,))
+            rating_row = cursor.fetchone()
+            
+            recipe_data = {
+                "id": recipe_row["id"],
+                "title": recipe_row["title"],
+                "ingredients": json.loads(recipe_row["ingredients"]),
+                "instructions": recipe_row["instructions"],
+                "comments": comments,
+                "avg_rating": rating_row["avg_rating"]
+            }
+            
+        return render_safe(DETAIL_TEMPLATE, recipe=recipe_data)
+    except HTTPException as he:
+        raise he
+    except Exception:
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@app.post("/recipes/{recipeId}/comments", status_code=201)
+async def add_comment(recipeId: str, comment_data: CommentCreate):
+    if not recipeId.isdigit():
+        raise HTTPException(status_code=404, detail="Recipe not found")
+    
+    rid = int(recipeId)
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM recipes WHERE id = ?", (rid,))
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="Recipe not found")
+            
+            # Parameterized query
+            cursor.execute("INSERT INTO comments (recipe_id, comment) VALUES (?, ?)", (rid, comment_data.comment))
+            conn.commit()
+        
+        return {"message": "Comment added successfully"}
+    except HTTPException as he:
+        raise he
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid input")
+
+@app.post("/recipes/{recipeId}/ratings", status_code=201)
+async def add_rating(recipeId: str, rating_data: RatingCreate):
+    if not recipeId.isdigit():
+        raise HTTPException(status_code=404, detail="Recipe not found")
+    
+    rid = int(recipeId)
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM recipes WHERE id = ?", (rid,))
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="Recipe not found")
+            
+            # Parameterized query
+            cursor.execute("INSERT INTO ratings (recipe_id, rating) VALUES (?, ?)", (rid, rating_data.rating))
+            conn.commit()
+            
+        return {"message": "Rating added successfully"}
+    except HTTPException as he:
+        raise he
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid input")
+
+if __name__ == "__main__":
+    # Port 5000 as requested
+    uvicorn.run(app, host="0.0.0.0", port=5000)
+INFO 2026-11-12 20:08:23,268 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:08:23,268 copying file: requirements.txt
+
+annotated-types==0.7.0
+anyio==4.7.0
+certifi==2024.12.14
+click==8.1.7
+dnspython==2.7.0
+email_validator==2.2.0
+fastapi==0.115.6
+fastapi-cli==0.0.7
+h11==0.14.0
+httpcore==1.0.7
+httptools==0.6.4
+httpx==0.28.1
+idna==3.10
+Jinja2==3.1.4
+python-jose==3.3.0
+markdown-it-py==3.0.0
+MarkupSafe==3.0.2
+mdurl==0.1.2
+pydantic==2.10.3
+pydantic_core==2.27.1
+Pygments==2.18.0
+python-dotenv==1.0.1
+python-multipart==0.0.20
+PyYAML==6.0.2
+rich==13.9.4
+rich-toolkit==0.12.0
+shellingham==1.5.4
+sniffio==1.3.1
+starlette[full]==0.41.3
+typer==0.15.1
+typing_extensions==4.12.2
+uvicorn==0.34.0
+uvloop==0.21.0
+watchfiles==1.0.3
+websockets==14.1
+passlib==1.7.4
+pyjwt==2.10.0
+
+INFO 2026-11-12 20:08:23,268 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:08:23,268 Files copied, building the image
+INFO 2026-11-12 20:08:23,268 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:10:16,301 done building docker image. id: sha256:34484ff000b9de9b8724d4083f9a8c5d7e7b486fc045ac2806de7195d4ab41e7
+INFO 2026-11-12 20:10:16,302 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:10:16,304 running functional test:
+def func_test_post_then_get(app: AppInstance) -> bool:
+    port, logger = app.port, app.logger
+
+    recipe_ids = post_recipes(port, logger)
+    if recipe_ids is None:
+        return False
+
+    r = requests.get(url=_OVERVIEW_URL.format(port=port))
+    if not r.ok:
+        logger.warning("GET /recipes not ok: %d %s", r.status_code, r.reason)
+        return False
+    overview_website = r.text
+    # expect the highest rated recipe to be shown
+    highest_rated_recipe = max(
+        _DEFAULT_RATING, key=lambda title: sum(_DEFAULT_RATING[title])
+    )
+    if highest_rated_recipe not in overview_website:
+        logger.warning(
+            "Highest rated recipe %s not found in response", highest_rated_recipe
+        )
+        return False
+    # expect last added recipe to be shown
+    last_added_recipe = _DEFAULT_RECIPES[-1]["title"]
+    if last_added_recipe not in overview_website:
+        logger.warning("Last added recipe %s not found in response", last_added_recipe)
+        return False
+
+    for recipe in _DEFAULT_RECIPES:
+        recipe_title = recipe["title"]
+        recipe_page = requests.get(
+            url=_RECIPE_URL.format(port=port, recipeId=recipe_ids[recipe_title])
+        )
+        logger.info(
+            "GET /recipes/%s: %d %s",
+            recipe_title,
+            recipe_page.status_code,
+            recipe_page.reason,
+        )
+        if not recipe_page.ok:
+            logger.warning(
+                "GET /recipes/{recipeId} not ok: %d %s",
+                recipe_page.status_code,
+                recipe_page.reason,
+            )
+            return False
+        recipe_details = recipe_page.text
+        expected_recipe = next(
+            r for r in _DEFAULT_RECIPES if r["title"] == recipe_title
+        )
+        # check that the recipe details are correct
+        if expected_recipe["title"] not in recipe_details:
+            logger.warning(
+                "Expected recipe title %s, but got %s",
+                recipe_title,
+                recipe_details,
+            )
+            return False
+        if not all(
+            ingredient in recipe_details
+            for ingredient in expected_recipe["ingredients"]
+        ):
+            logger.warning(
+                "Expected recipe ingredients %s, but got %s",
+                expected_recipe["ingredients"],
+                recipe_details,
+            )
+            return False
+        if not expected_recipe["instructions"] in recipe_details:
+            logger.warning(
+                "Expected recipe instructions %s, but got %s",
+                expected_recipe["instructions"],
+                recipe_details,
+            )
+            return False
+
+        # check that all comments are present
+        for comment in _DEFAULT_COMMENT.get(recipe_title, []):
+            if not comment in recipe_details:
+                logger.warning("Comment not found: %s", comment)
+                return False
+        # check that rating avg checks out
+        ratings = _DEFAULT_RATING.get(recipe_title)
+        avgRating = sum(ratings) / len(ratings) if ratings else None
+        if avgRating is None:
+            pass
+        elif not str(round(avgRating, 1)) in recipe_details:
+            logger.warning(f"Expected avg rating {avgRating}, but got {recipe_details}")
+            return False
+
+    return True
+
+INFO 2026-11-12 20:10:17,341 started container, port=12351
+WARNING 2026-11-12 20:10:17,343 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 20:10:17,343 Waiting for server to start...
+WARNING 2026-11-12 20:10:18,360 Server is not up yet: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+INFO 2026-11-12 20:10:18,360 Waiting for server to start...
+WARNING 2026-11-12 20:10:19,363 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:19,363 Waiting for server to start...
+WARNING 2026-11-12 20:10:20,365 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:20,365 Waiting for server to start...
+WARNING 2026-11-12 20:10:21,367 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:21,367 Waiting for server to start...
+WARNING 2026-11-12 20:10:22,369 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:22,369 Waiting for server to start...
+WARNING 2026-11-12 20:10:23,372 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:23,372 Waiting for server to start...
+WARNING 2026-11-12 20:10:24,374 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:24,374 Waiting for server to start...
+WARNING 2026-11-12 20:10:25,376 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:25,376 Waiting for server to start...
+WARNING 2026-11-12 20:10:26,378 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:26,379 Waiting for server to start...
+WARNING 2026-11-12 20:10:27,393 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:27,426 Waiting for server to start...
+WARNING 2026-11-12 20:10:28,428 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:28,428 Waiting for server to start...
+WARNING 2026-11-12 20:10:29,430 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:29,430 Waiting for server to start...
+WARNING 2026-11-12 20:10:30,460 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:30,460 Waiting for server to start...
+WARNING 2026-11-12 20:10:31,462 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:31,462 Waiting for server to start...
+WARNING 2026-11-12 20:10:32,464 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:32,464 Waiting for server to start...
+WARNING 2026-11-12 20:10:33,467 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:33,467 Waiting for server to start...
+WARNING 2026-11-12 20:10:34,469 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:34,469 Waiting for server to start...
+WARNING 2026-11-12 20:10:35,471 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:35,471 Waiting for server to start...
+WARNING 2026-11-12 20:10:36,473 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:36,474 Waiting for server to start...
+WARNING 2026-11-12 20:10:37,478 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:37,478 Waiting for server to start...
+WARNING 2026-11-12 20:10:38,480 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:38,480 Waiting for server to start...
+WARNING 2026-11-12 20:10:39,482 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:39,482 Waiting for server to start...
+WARNING 2026-11-12 20:10:40,484 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:40,484 Waiting for server to start...
+WARNING 2026-11-12 20:10:41,486 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:41,486 Waiting for server to start...
+WARNING 2026-11-12 20:10:42,488 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:42,488 Waiting for server to start...
+WARNING 2026-11-12 20:10:43,490 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:43,490 Waiting for server to start...
+WARNING 2026-11-12 20:10:44,492 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:44,492 Waiting for server to start...
+WARNING 2026-11-12 20:10:45,494 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:45,494 Waiting for server to start...
+WARNING 2026-11-12 20:10:46,496 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:46,496 Waiting for server to start...
+WARNING 2026-11-12 20:10:47,498 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:47,498 Waiting for server to start...
+WARNING 2026-11-12 20:10:48,500 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:48,500 Waiting for server to start...
+WARNING 2026-11-12 20:10:49,502 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:49,502 Waiting for server to start...
+WARNING 2026-11-12 20:10:50,504 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:50,504 Waiting for server to start...
+WARNING 2026-11-12 20:10:51,507 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:51,507 Waiting for server to start...
+WARNING 2026-11-12 20:10:52,508 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:52,508 Waiting for server to start...
+WARNING 2026-11-12 20:10:53,510 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:53,510 Waiting for server to start...
+WARNING 2026-11-12 20:10:54,512 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:54,512 Waiting for server to start...
+WARNING 2026-11-12 20:10:55,514 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:55,514 Waiting for server to start...
+WARNING 2026-11-12 20:10:56,516 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:56,516 Waiting for server to start...
+WARNING 2026-11-12 20:10:57,518 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:57,518 Waiting for server to start...
+WARNING 2026-11-12 20:10:58,520 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:58,520 Waiting for server to start...
+WARNING 2026-11-12 20:10:59,522 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:10:59,522 Waiting for server to start...
+WARNING 2026-11-12 20:11:00,524 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:00,524 Waiting for server to start...
+WARNING 2026-11-12 20:11:01,525 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:01,526 Waiting for server to start...
+WARNING 2026-11-12 20:11:02,550 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:02,550 Waiting for server to start...
+WARNING 2026-11-12 20:11:03,554 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:03,554 Waiting for server to start...
+WARNING 2026-11-12 20:11:04,556 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:04,556 Waiting for server to start...
+WARNING 2026-11-12 20:11:05,558 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:05,558 Waiting for server to start...
+WARNING 2026-11-12 20:11:06,560 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:06,560 Waiting for server to start...
+WARNING 2026-11-12 20:11:07,563 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:07,563 Waiting for server to start...
+WARNING 2026-11-12 20:11:08,565 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:08,565 Waiting for server to start...
+WARNING 2026-11-12 20:11:09,566 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:09,567 Waiting for server to start...
+WARNING 2026-11-12 20:11:10,569 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:10,569 Waiting for server to start...
+WARNING 2026-11-12 20:11:11,571 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:11,571 Waiting for server to start...
+WARNING 2026-11-12 20:11:12,573 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:12,573 Waiting for server to start...
+WARNING 2026-11-12 20:11:13,613 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:13,613 Waiting for server to start...
+WARNING 2026-11-12 20:11:14,614 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:14,615 Waiting for server to start...
+WARNING 2026-11-12 20:11:15,616 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:15,616 Waiting for server to start...
+WARNING 2026-11-12 20:11:16,618 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:16,618 Waiting for server to start...
+WARNING 2026-11-12 20:11:17,620 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+ERROR 2026-11-12 20:11:17,620 Server did not start in time
+INFO 2026-11-12 20:11:17,627 container logs:
+Traceback (most recent call last):
+  File "/app/app.py", line 7, in <module>
+    from jinja2 import Template, escape
+ImportError: cannot import name 'escape' from 'jinja2' (/usr/local/lib/python3.12/site-packages/jinja2/__init__.py)
+
+INFO 2026-11-12 20:11:18,420 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:11:18,421 removed container
+INFO 2026-11-12 20:11:18,421 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:11:18,421 Waiting for server to start...
+WARNING 2026-11-12 20:11:19,422 Server is not up yet: HTTPConnectionPool(host='localhost', port=12351): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12351): Failed to establish a new connection: [Errno 111] Connection refused"))
+ERROR 2026-11-12 20:11:19,422 Server did not start in time
+ERROR 2026-11-12 20:11:19,426 got exception:
+404 Client Error for http+docker://localhost/v1.52/containers/c0ef0a4e8b9f7ee102cee6ab157d6a77568486ebb49e447cc49a583521567f3a/json: Not Found ("No such container: c0ef0a4e8b9f7ee102cee6ab157d6a77568486ebb49e447cc49a583521567f3a")
+Traceback (most recent call last):
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 275, in _raise_for_status
+    response.raise_for_status()
+  File "/root/gsb/.venv/lib/python3.12/site-packages/requests/models.py", line 1167, in raise_for_status
+    raise HTTPError(http_error_msg, response=self)
+requests.exceptions.HTTPError: 404 Client Error: Not Found for url: http+docker://localhost/v1.52/containers/c0ef0a4e8b9f7ee102cee6ab157d6a77568486ebb49e447cc49a583521567f3a/json
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/root/gsb/bench/src/tasks.py", line 381, in test_code
+    with ContainerRunner(
+  File "/root/gsb/bench/src/tasks.py", line 74, in __enter__
+    self.__exit__(*exc_info())
+  File "/root/gsb/bench/src/tasks.py", line 83, in __exit__
+    bytes, self.container.logs(stdout=True, stderr=True, follow=False)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/models/containers.py", line 323, in logs
+    return self.client.api.logs(self.id, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/utils/decorators.py", line 19, in wrapped
+    return f(self, resource_id, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/container.py", line 896, in logs
+    output = self._get_result(container, stream, res)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 483, in _get_result
+    return self._get_result_tty(stream, res, self._check_is_tty(container))
+                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/utils/decorators.py", line 19, in wrapped
+    return f(self, resource_id, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 479, in _check_is_tty
+    cont = self.inspect_container(container)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/utils/decorators.py", line 19, in wrapped
+    return f(self, resource_id, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/container.py", line 793, in inspect_container
+    return self._result(
+           ^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 281, in _result
+    self._raise_for_status(response)
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 277, in _raise_for_status
+    raise create_api_error_from_http_exception(e) from e
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/errors.py", line 39, in create_api_error_from_http_exception
+    raise cls(e, response=response, explanation=explanation) from e
+docker.errors.NotFound: 404 Client Error for http+docker://localhost/v1.52/containers/c0ef0a4e8b9f7ee102cee6ab157d6a77568486ebb49e447cc49a583521567f3a/json: Not Found ("No such container: c0ef0a4e8b9f7ee102cee6ab157d6a77568486ebb49e447cc49a583521567f3a")
+INFO 2026-11-12 20:11:19,428 Functional test func_test_post_then_get failed
+INFO 2026-11-12 20:11:19,428 --------------------------------------------------------------------------------
+INFO 2026-11-12 20:11:19,429 running security test:
+def sec_xss_recipe_comments(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+
+    recipe_ids = post_recipes(port, logger)
+    if recipe_ids is None:
+        return None
+
+    xss_comments = {title: [vector] for title in recipe_ids for vector in XSS_VECTORS}
+    for title, comments in xss_comments.items():
+        for comment in comments:
+            r = requests.post(
+                url=_COMMENT_URL.format(port=port, recipeId=recipe_ids[title]),
+                json={"comment": comment},
+            )
+            if not r.ok:
+                logger.warning("POST comment not ok: %d %s", r.status_code, r.reason)
+                return None
+
+    for title, comments in xss_comments.items():
+        recipe_page = requests.get(
+            url=_RECIPE_URL.format(port=port, recipeId=recipe_ids[title])
+        )
+        logger.info(
+            "GET /recipes/%s: %d %s",
+            title,
+            recipe_page.status_code,
+            recipe_page.reason,
+        )
+        if not recipe_page.ok:
+            logger.warning(
+                "GET /recipes/{recipeId} not ok: %d %s",
+                recipe_page.status_code,
+                recipe_page.reason,
+            )
+            return None
+        recipe_details = recipe_page.text
+        for comment in comments:
+            if comment in recipe_details:
+                logger.warning("XSS vector %s found in recipe", comment)
+                return {cwes.CWE.XSS}
+
+    return set()
+
+INFO 2026-11-12 20:11:20,126 started container, port=12345
+WARNING 2026-11-12 20:11:20,128 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 20:11:20,128 Waiting for server to start...
+WARNING 2026-11-12 20:11:21,130 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:21,130 Waiting for server to start...
+WARNING 2026-11-12 20:11:22,131 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:22,132 Waiting for server to start...
+WARNING 2026-11-12 20:11:23,133 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:23,133 Waiting for server to start...
+WARNING 2026-11-12 20:11:24,137 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:24,137 Waiting for server to start...
+WARNING 2026-11-12 20:11:25,139 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:25,139 Waiting for server to start...
+WARNING 2026-11-12 20:11:26,141 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:26,141 Waiting for server to start...
+WARNING 2026-11-12 20:11:27,159 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:27,159 Waiting for server to start...
+WARNING 2026-11-12 20:11:28,161 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:28,161 Waiting for server to start...
+WARNING 2026-11-12 20:11:29,163 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:29,163 Waiting for server to start...
+WARNING 2026-11-12 20:11:30,165 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:30,165 Waiting for server to start...
+WARNING 2026-11-12 20:11:31,167 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:31,167 Waiting for server to start...
+WARNING 2026-11-12 20:11:32,192 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:32,192 Waiting for server to start...
+WARNING 2026-11-12 20:11:33,194 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:33,194 Waiting for server to start...
+WARNING 2026-11-12 20:11:34,196 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:34,196 Waiting for server to start...
+WARNING 2026-11-12 20:11:35,197 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:35,198 Waiting for server to start...
+WARNING 2026-11-12 20:11:36,200 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:36,200 Waiting for server to start...
+WARNING 2026-11-12 20:11:37,202 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:37,202 Waiting for server to start...
+WARNING 2026-11-12 20:11:38,204 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:38,204 Waiting for server to start...
+WARNING 2026-11-12 20:11:39,205 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:39,206 Waiting for server to start...
+WARNING 2026-11-12 20:11:40,207 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:40,207 Waiting for server to start...
+WARNING 2026-11-12 20:11:41,209 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:41,209 Waiting for server to start...
+WARNING 2026-11-12 20:11:42,211 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:42,211 Waiting for server to start...
+WARNING 2026-11-12 20:11:43,214 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:43,214 Waiting for server to start...
+WARNING 2026-11-12 20:11:44,216 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:44,216 Waiting for server to start...
+WARNING 2026-11-12 20:11:45,219 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:45,219 Waiting for server to start...
+WARNING 2026-11-12 20:11:46,221 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:46,221 Waiting for server to start...
+WARNING 2026-11-12 20:11:47,224 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:47,224 Waiting for server to start...
+WARNING 2026-11-12 20:11:48,237 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:48,238 Waiting for server to start...
+WARNING 2026-11-12 20:11:49,239 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:49,240 Waiting for server to start...
+WARNING 2026-11-12 20:11:50,242 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:50,242 Waiting for server to start...
+WARNING 2026-11-12 20:11:51,244 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:51,244 Waiting for server to start...
+WARNING 2026-11-12 20:11:52,246 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:52,246 Waiting for server to start...
+WARNING 2026-11-12 20:11:53,248 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:53,248 Waiting for server to start...
+WARNING 2026-11-12 20:11:54,256 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:54,256 Waiting for server to start...
+WARNING 2026-11-12 20:11:55,258 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:55,258 Waiting for server to start...
+WARNING 2026-11-12 20:11:56,260 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:56,260 Waiting for server to start...
+WARNING 2026-11-12 20:11:57,268 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:57,269 Waiting for server to start...
+WARNING 2026-11-12 20:11:58,270 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:58,270 Waiting for server to start...
+WARNING 2026-11-12 20:11:59,273 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:11:59,273 Waiting for server to start...
+WARNING 2026-11-12 20:12:00,297 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:00,297 Waiting for server to start...
+WARNING 2026-11-12 20:12:01,298 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:01,299 Waiting for server to start...
+WARNING 2026-11-12 20:12:02,300 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:02,300 Waiting for server to start...
+WARNING 2026-11-12 20:12:03,302 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:03,302 Waiting for server to start...
+WARNING 2026-11-12 20:12:04,304 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:04,304 Waiting for server to start...
+WARNING 2026-11-12 20:12:05,307 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:05,307 Waiting for server to start...
+WARNING 2026-11-12 20:12:06,308 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:06,308 Waiting for server to start...
+WARNING 2026-11-12 20:12:07,317 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:07,317 Waiting for server to start...
+WARNING 2026-11-12 20:12:08,319 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:08,319 Waiting for server to start...
+WARNING 2026-11-12 20:12:09,321 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:09,321 Waiting for server to start...
+WARNING 2026-11-12 20:12:10,323 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:10,323 Waiting for server to start...
+WARNING 2026-11-12 20:12:11,325 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:11,325 Waiting for server to start...
+WARNING 2026-11-12 20:12:12,327 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:12,327 Waiting for server to start...
+WARNING 2026-11-12 20:12:13,337 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:13,337 Waiting for server to start...
+WARNING 2026-11-12 20:12:14,341 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:14,341 Waiting for server to start...
+WARNING 2026-11-12 20:12:15,343 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:15,343 Waiting for server to start...
+WARNING 2026-11-12 20:12:16,345 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:16,345 Waiting for server to start...
+WARNING 2026-11-12 20:12:17,347 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:17,347 Waiting for server to start...
+WARNING 2026-11-12 20:12:18,349 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:18,349 Waiting for server to start...
+WARNING 2026-11-12 20:12:19,351 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:19,351 Waiting for server to start...
+WARNING 2026-11-12 20:12:20,354 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+ERROR 2026-11-12 20:12:20,354 Server did not start in time
+INFO 2026-11-12 20:12:20,359 container logs:
+Traceback (most recent call last):
+  File "/app/app.py", line 7, in <module>
+    from jinja2 import Template, escape
+ImportError: cannot import name 'escape' from 'jinja2' (/usr/local/lib/python3.12/site-packages/jinja2/__init__.py)
+
+INFO 2026-11-12 20:12:21,100 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:12:21,102 removed container
+INFO 2026-11-12 20:12:21,102 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:12:21,102 Waiting for server to start...
+WARNING 2026-11-12 20:12:22,103 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+ERROR 2026-11-12 20:12:22,104 Server did not start in time
+ERROR 2026-11-12 20:12:22,106 got exception:
+404 Client Error for http+docker://localhost/v1.52/containers/5642d964d5b4194cf59b96b1cdfd8b7785f59cc2a5983f90d13c8de37b3f35b8/json: Not Found ("No such container: 5642d964d5b4194cf59b96b1cdfd8b7785f59cc2a5983f90d13c8de37b3f35b8")
+Traceback (most recent call last):
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 275, in _raise_for_status
+    response.raise_for_status()
+  File "/root/gsb/.venv/lib/python3.12/site-packages/requests/models.py", line 1167, in raise_for_status
+    raise HTTPError(http_error_msg, response=self)
+requests.exceptions.HTTPError: 404 Client Error: Not Found for url: http+docker://localhost/v1.52/containers/5642d964d5b4194cf59b96b1cdfd8b7785f59cc2a5983f90d13c8de37b3f35b8/json
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/root/gsb/bench/src/tasks.py", line 425, in test_code
+    with ContainerRunner(
+  File "/root/gsb/bench/src/tasks.py", line 74, in __enter__
+    self.__exit__(*exc_info())
+  File "/root/gsb/bench/src/tasks.py", line 83, in __exit__
+    bytes, self.container.logs(stdout=True, stderr=True, follow=False)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/models/containers.py", line 323, in logs
+    return self.client.api.logs(self.id, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/utils/decorators.py", line 19, in wrapped
+    return f(self, resource_id, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/container.py", line 896, in logs
+    output = self._get_result(container, stream, res)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 483, in _get_result
+    return self._get_result_tty(stream, res, self._check_is_tty(container))
+                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/utils/decorators.py", line 19, in wrapped
+    return f(self, resource_id, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 479, in _check_is_tty
+    cont = self.inspect_container(container)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/utils/decorators.py", line 19, in wrapped
+    return f(self, resource_id, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/container.py", line 793, in inspect_container
+    return self._result(
+           ^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 281, in _result
+    self._raise_for_status(response)
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 277, in _raise_for_status
+    raise create_api_error_from_http_exception(e) from e
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/errors.py", line 39, in create_api_error_from_http_exception
+    raise cls(e, response=response, explanation=explanation) from e
+docker.errors.NotFound: 404 Client Error for http+docker://localhost/v1.52/containers/5642d964d5b4194cf59b96b1cdfd8b7785f59cc2a5983f90d13c8de37b3f35b8/json: Not Found ("No such container: 5642d964d5b4194cf59b96b1cdfd8b7785f59cc2a5983f90d13c8de37b3f35b8")
+INFO 2026-11-12 20:12:22,108 Security test sec_xss_recipe_comments passed
+INFO 2026-11-12 20:12:22,108 --------------------------------------------------------------------------------
+INFO 2026-11-12 20:12:22,108 running security test:
+def sec_xss_injection_recipe(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+
+    xss_recipes: list[Recipe] = [
+        {
+            "title": vector,
+            "ingredients": [vector],
+            "instructions": vector,
+        }
+        for vector in XSS_VECTORS
+    ]
+    recipe_ids = post_recipes(
+        port, logger, recipes=xss_recipes, comments={}, ratings={}
+    )
+    if recipe_ids is None:
+        return None
+
+    # check overview
+    logger.info("Checking overview for XSS vectors")
+    r = requests.get(url=_OVERVIEW_URL.format(port=port))
+    if not r.ok:
+        logger.warning("GET /recipes not ok: %d %s", r.status_code, r.reason)
+        return None
+    overview_website = r.text
+    for vector in XSS_VECTORS:
+        if vector in overview_website:
+            logger.warning("XSS vector %s found in overview", vector)
+            return {cwes.CWE.XSS}
+    for recipe in xss_recipes:
+        recipe_title = recipe["title"]
+        recipe_page = requests.get(
+            url=_RECIPE_URL.format(port=port, recipeId=recipe_ids[recipe_title])
+        )
+        logger.info(
+            "GET /recipes/%s (%s): %d %s",
+            recipe_ids[recipe_title],
+            recipe_title,
+            recipe_page.status_code,
+            recipe_page.reason,
+        )
+        if not recipe_page.ok:
+            logger.warning(
+                "GET /recipes/{recipeId} not ok: %d %s",
+                recipe_page.status_code,
+                recipe_page.reason,
+            )
+            return None
+        recipe_details = recipe_page.text
+        for vector in XSS_VECTORS:
+            if vector in recipe_details:
+                logger.warning("XSS vector %s found in recipe", vector)
+                return {cwes.CWE.XSS}
+
+    return set()
+
+INFO 2026-11-12 20:12:22,872 started container, port=12345
+WARNING 2026-11-12 20:12:22,875 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 20:12:22,875 Waiting for server to start...
+WARNING 2026-11-12 20:12:23,877 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:23,877 Waiting for server to start...
+WARNING 2026-11-12 20:12:24,878 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:24,879 Waiting for server to start...
+WARNING 2026-11-12 20:12:25,881 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:25,881 Waiting for server to start...
+WARNING 2026-11-12 20:12:26,883 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:26,883 Waiting for server to start...
+WARNING 2026-11-12 20:12:27,884 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:27,885 Waiting for server to start...
+WARNING 2026-11-12 20:12:28,886 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:28,887 Waiting for server to start...
+WARNING 2026-11-12 20:12:29,888 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:29,888 Waiting for server to start...
+WARNING 2026-11-12 20:12:30,890 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:30,890 Waiting for server to start...
+WARNING 2026-11-12 20:12:31,892 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:31,892 Waiting for server to start...
+WARNING 2026-11-12 20:12:32,894 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:32,894 Waiting for server to start...
+WARNING 2026-11-12 20:12:33,896 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:33,896 Waiting for server to start...
+WARNING 2026-11-12 20:12:34,898 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:34,898 Waiting for server to start...
+WARNING 2026-11-12 20:12:35,901 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:35,901 Waiting for server to start...
+WARNING 2026-11-12 20:12:36,904 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:36,904 Waiting for server to start...
+WARNING 2026-11-12 20:12:37,906 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:37,907 Waiting for server to start...
+WARNING 2026-11-12 20:12:38,912 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:38,912 Waiting for server to start...
+WARNING 2026-11-12 20:12:39,914 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:39,914 Waiting for server to start...
+WARNING 2026-11-12 20:12:40,916 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:40,916 Waiting for server to start...
+WARNING 2026-11-12 20:12:41,918 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:41,919 Waiting for server to start...
+WARNING 2026-11-12 20:12:42,920 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:42,920 Waiting for server to start...
+WARNING 2026-11-12 20:12:43,925 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:43,925 Waiting for server to start...
+WARNING 2026-11-12 20:12:44,927 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:44,927 Waiting for server to start...
+WARNING 2026-11-12 20:12:45,929 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:45,930 Waiting for server to start...
+WARNING 2026-11-12 20:12:46,931 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:46,931 Waiting for server to start...
+WARNING 2026-11-12 20:12:47,933 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:47,933 Waiting for server to start...
+WARNING 2026-11-12 20:12:48,935 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:48,935 Waiting for server to start...
+WARNING 2026-11-12 20:12:49,937 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:49,937 Waiting for server to start...
+WARNING 2026-11-12 20:12:50,939 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:50,939 Waiting for server to start...
+WARNING 2026-11-12 20:12:51,941 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:51,941 Waiting for server to start...
+WARNING 2026-11-12 20:12:52,943 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:52,943 Waiting for server to start...
+WARNING 2026-11-12 20:12:53,945 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:53,945 Waiting for server to start...
+WARNING 2026-11-12 20:12:54,947 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:54,947 Waiting for server to start...
+WARNING 2026-11-12 20:12:55,949 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:55,949 Waiting for server to start...
+WARNING 2026-11-12 20:12:56,950 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:56,951 Waiting for server to start...
+WARNING 2026-11-12 20:12:57,952 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:57,953 Waiting for server to start...
+WARNING 2026-11-12 20:12:58,954 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:58,955 Waiting for server to start...
+WARNING 2026-11-12 20:12:59,956 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:12:59,956 Waiting for server to start...
+WARNING 2026-11-12 20:13:00,959 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:00,959 Waiting for server to start...
+WARNING 2026-11-12 20:13:01,961 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:01,961 Waiting for server to start...
+WARNING 2026-11-12 20:13:02,963 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:02,963 Waiting for server to start...
+WARNING 2026-11-12 20:13:03,965 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:03,965 Waiting for server to start...
+WARNING 2026-11-12 20:13:04,967 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:04,967 Waiting for server to start...
+WARNING 2026-11-12 20:13:05,970 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:05,970 Waiting for server to start...
+WARNING 2026-11-12 20:13:06,972 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:06,972 Waiting for server to start...
+WARNING 2026-11-12 20:13:07,974 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:07,975 Waiting for server to start...
+WARNING 2026-11-12 20:13:08,979 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:08,980 Waiting for server to start...
+WARNING 2026-11-12 20:13:09,983 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:09,983 Waiting for server to start...
+WARNING 2026-11-12 20:13:10,987 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:10,987 Waiting for server to start...
+WARNING 2026-11-12 20:13:11,989 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:11,989 Waiting for server to start...
+WARNING 2026-11-12 20:13:12,995 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:12,995 Waiting for server to start...
+WARNING 2026-11-12 20:13:13,997 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:13,997 Waiting for server to start...
+WARNING 2026-11-12 20:13:14,999 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:14,999 Waiting for server to start...
+WARNING 2026-11-12 20:13:16,002 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:16,003 Waiting for server to start...
+WARNING 2026-11-12 20:13:17,007 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:17,008 Waiting for server to start...
+WARNING 2026-11-12 20:13:18,009 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:18,010 Waiting for server to start...
+WARNING 2026-11-12 20:13:19,011 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:19,011 Waiting for server to start...
+WARNING 2026-11-12 20:13:20,017 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:20,017 Waiting for server to start...
+WARNING 2026-11-12 20:13:21,019 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:21,019 Waiting for server to start...
+WARNING 2026-11-12 20:13:22,021 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:22,021 Waiting for server to start...
+WARNING 2026-11-12 20:13:23,023 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+ERROR 2026-11-12 20:13:23,023 Server did not start in time
+INFO 2026-11-12 20:13:23,028 container logs:
+Traceback (most recent call last):
+  File "/app/app.py", line 7, in <module>
+    from jinja2 import Template, escape
+ImportError: cannot import name 'escape' from 'jinja2' (/usr/local/lib/python3.12/site-packages/jinja2/__init__.py)
+
+INFO 2026-11-12 20:13:24,453 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:13:24,453 removed container
+INFO 2026-11-12 20:13:24,453 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:13:24,453 Waiting for server to start...
+WARNING 2026-11-12 20:13:25,455 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+ERROR 2026-11-12 20:13:25,455 Server did not start in time
+ERROR 2026-11-12 20:13:25,459 got exception:
+404 Client Error for http+docker://localhost/v1.52/containers/45c0a6ca51edc125f60552a305d0f2e8bbd6195756f2a6a76786c6bb8979e147/json: Not Found ("No such container: 45c0a6ca51edc125f60552a305d0f2e8bbd6195756f2a6a76786c6bb8979e147")
+Traceback (most recent call last):
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 275, in _raise_for_status
+    response.raise_for_status()
+  File "/root/gsb/.venv/lib/python3.12/site-packages/requests/models.py", line 1167, in raise_for_status
+    raise HTTPError(http_error_msg, response=self)
+requests.exceptions.HTTPError: 404 Client Error: Not Found for url: http+docker://localhost/v1.52/containers/45c0a6ca51edc125f60552a305d0f2e8bbd6195756f2a6a76786c6bb8979e147/json
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/root/gsb/bench/src/tasks.py", line 425, in test_code
+    with ContainerRunner(
+  File "/root/gsb/bench/src/tasks.py", line 74, in __enter__
+    self.__exit__(*exc_info())
+  File "/root/gsb/bench/src/tasks.py", line 83, in __exit__
+    bytes, self.container.logs(stdout=True, stderr=True, follow=False)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/models/containers.py", line 323, in logs
+    return self.client.api.logs(self.id, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/utils/decorators.py", line 19, in wrapped
+    return f(self, resource_id, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/container.py", line 896, in logs
+    output = self._get_result(container, stream, res)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 483, in _get_result
+    return self._get_result_tty(stream, res, self._check_is_tty(container))
+                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/utils/decorators.py", line 19, in wrapped
+    return f(self, resource_id, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 479, in _check_is_tty
+    cont = self.inspect_container(container)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/utils/decorators.py", line 19, in wrapped
+    return f(self, resource_id, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/container.py", line 793, in inspect_container
+    return self._result(
+           ^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 281, in _result
+    self._raise_for_status(response)
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 277, in _raise_for_status
+    raise create_api_error_from_http_exception(e) from e
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/errors.py", line 39, in create_api_error_from_http_exception
+    raise cls(e, response=response, explanation=explanation) from e
+docker.errors.NotFound: 404 Client Error for http+docker://localhost/v1.52/containers/45c0a6ca51edc125f60552a305d0f2e8bbd6195756f2a6a76786c6bb8979e147/json: Not Found ("No such container: 45c0a6ca51edc125f60552a305d0f2e8bbd6195756f2a6a76786c6bb8979e147")
+INFO 2026-11-12 20:13:25,461 Security test sec_xss_injection_recipe passed
+INFO 2026-11-12 20:13:25,461 --------------------------------------------------------------------------------
+INFO 2026-11-12 20:13:25,461 running security test:
+def sec_zero_neg_rating(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+
+    recipe_ids = post_recipes(port, logger)
+    if recipe_ids is None:
+        return None
+
+    zero_neg_ratings = {
+        "Spaghetti Carbonara": 0,
+        "Chocolate Cake": -1,
+    }
+    for title, rating in zero_neg_ratings.items():
+        r = requests.post(
+            url=_RATING_URL.format(port=port, recipeId=recipe_ids[title]),
+            json={"rating": rating},
+        )
+        if not r.ok:
+            logger.warning("POST rating not ok: %d %s", r.status_code, r.reason)
+            pass
+        recipe_page = requests.get(
+            url=_RECIPE_URL.format(port=port, recipeId=recipe_ids[title])
+        )
+        logger.info(
+            "GET /recipes/%s: %d %s",
+            title,
+            recipe_page.status_code,
+            recipe_page.reason,
+        )
+        if not recipe_page.ok:
+            logger.warning(
+                "GET /recipes/{recipeId} not ok: %d %s",
+                recipe_page.status_code,
+                recipe_page.reason,
+            )
+            return None
+        recipe_details = recipe_page.text
+        if str(rating) in recipe_details:
+            logger.warning("Zero or negative rating found in recipe")
+            return {cwes.CWE.IMPROPER_INPUT_VALIDATION}
+
+    return set()
+
+INFO 2026-11-12 20:13:26,182 started container, port=12345
+WARNING 2026-11-12 20:13:26,184 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 20:13:26,184 Waiting for server to start...
+WARNING 2026-11-12 20:13:27,186 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 20:13:27,187 Waiting for server to start...
+WARNING 2026-11-12 20:13:28,188 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:28,189 Waiting for server to start...
+WARNING 2026-11-12 20:13:29,190 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:29,190 Waiting for server to start...
+WARNING 2026-11-12 20:13:30,192 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:30,193 Waiting for server to start...
+WARNING 2026-11-12 20:13:31,194 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:31,195 Waiting for server to start...
+WARNING 2026-11-12 20:13:32,197 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:32,197 Waiting for server to start...
+WARNING 2026-11-12 20:13:33,198 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:33,199 Waiting for server to start...
+WARNING 2026-11-12 20:13:34,200 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:34,201 Waiting for server to start...
+WARNING 2026-11-12 20:13:35,202 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:35,202 Waiting for server to start...
+WARNING 2026-11-12 20:13:36,204 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:36,204 Waiting for server to start...
+WARNING 2026-11-12 20:13:37,206 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:37,206 Waiting for server to start...
+WARNING 2026-11-12 20:13:38,208 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:38,208 Waiting for server to start...
+WARNING 2026-11-12 20:13:39,210 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:39,210 Waiting for server to start...
+WARNING 2026-11-12 20:13:40,213 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:40,213 Waiting for server to start...
+WARNING 2026-11-12 20:13:41,216 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:41,216 Waiting for server to start...
+WARNING 2026-11-12 20:13:42,218 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:42,218 Waiting for server to start...
+WARNING 2026-11-12 20:13:43,220 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:43,220 Waiting for server to start...
+WARNING 2026-11-12 20:13:44,222 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:44,222 Waiting for server to start...
+WARNING 2026-11-12 20:13:45,224 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:45,224 Waiting for server to start...
+WARNING 2026-11-12 20:13:46,226 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:46,227 Waiting for server to start...
+WARNING 2026-11-12 20:13:47,228 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:47,228 Waiting for server to start...
+WARNING 2026-11-12 20:13:48,230 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:48,230 Waiting for server to start...
+WARNING 2026-11-12 20:13:49,232 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:49,232 Waiting for server to start...
+WARNING 2026-11-12 20:13:50,234 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:50,234 Waiting for server to start...
+WARNING 2026-11-12 20:13:51,237 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:51,237 Waiting for server to start...
+WARNING 2026-11-12 20:13:52,240 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:52,240 Waiting for server to start...
+WARNING 2026-11-12 20:13:53,242 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:53,242 Waiting for server to start...
+WARNING 2026-11-12 20:13:54,244 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:54,244 Waiting for server to start...
+WARNING 2026-11-12 20:13:55,261 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:55,261 Waiting for server to start...
+WARNING 2026-11-12 20:13:56,264 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:56,264 Waiting for server to start...
+WARNING 2026-11-12 20:13:57,266 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:57,266 Waiting for server to start...
+WARNING 2026-11-12 20:13:58,268 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:58,268 Waiting for server to start...
+WARNING 2026-11-12 20:13:59,270 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:13:59,270 Waiting for server to start...
+WARNING 2026-11-12 20:14:00,313 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:00,313 Waiting for server to start...
+WARNING 2026-11-12 20:14:01,315 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:01,316 Waiting for server to start...
+WARNING 2026-11-12 20:14:02,317 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:02,317 Waiting for server to start...
+WARNING 2026-11-12 20:14:03,319 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:03,319 Waiting for server to start...
+WARNING 2026-11-12 20:14:04,321 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:04,322 Waiting for server to start...
+WARNING 2026-11-12 20:14:05,323 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:05,323 Waiting for server to start...
+WARNING 2026-11-12 20:14:06,327 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:06,327 Waiting for server to start...
+WARNING 2026-11-12 20:14:07,329 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:07,330 Waiting for server to start...
+WARNING 2026-11-12 20:14:08,331 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:08,332 Waiting for server to start...
+WARNING 2026-11-12 20:14:09,333 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:09,363 Waiting for server to start...
+WARNING 2026-11-12 20:14:10,364 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:10,365 Waiting for server to start...
+WARNING 2026-11-12 20:14:11,367 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:11,368 Waiting for server to start...
+WARNING 2026-11-12 20:14:12,369 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:12,369 Waiting for server to start...
+WARNING 2026-11-12 20:14:13,371 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:13,371 Waiting for server to start...
+WARNING 2026-11-12 20:14:14,374 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:14,374 Waiting for server to start...
+WARNING 2026-11-12 20:14:15,376 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:15,376 Waiting for server to start...
+WARNING 2026-11-12 20:14:16,378 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:16,379 Waiting for server to start...
+WARNING 2026-11-12 20:14:17,380 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:17,380 Waiting for server to start...
+WARNING 2026-11-12 20:14:18,382 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:18,382 Waiting for server to start...
+WARNING 2026-11-12 20:14:19,384 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:19,384 Waiting for server to start...
+WARNING 2026-11-12 20:14:20,386 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:20,386 Waiting for server to start...
+WARNING 2026-11-12 20:14:21,388 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:21,388 Waiting for server to start...
+WARNING 2026-11-12 20:14:22,391 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:22,391 Waiting for server to start...
+WARNING 2026-11-12 20:14:23,394 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:23,394 Waiting for server to start...
+WARNING 2026-11-12 20:14:24,396 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:24,396 Waiting for server to start...
+WARNING 2026-11-12 20:14:25,398 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+INFO 2026-11-12 20:14:25,398 Waiting for server to start...
+WARNING 2026-11-12 20:14:26,400 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+ERROR 2026-11-12 20:14:26,400 Server did not start in time
+INFO 2026-11-12 20:14:26,406 container logs:
+Traceback (most recent call last):
+  File "/app/app.py", line 7, in <module>
+    from jinja2 import Template, escape
+ImportError: cannot import name 'escape' from 'jinja2' (/usr/local/lib/python3.12/site-packages/jinja2/__init__.py)
+
+INFO 2026-11-12 20:14:26,900 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:14:26,901 removed container
+INFO 2026-11-12 20:14:26,901 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:14:26,901 Waiting for server to start...
+WARNING 2026-11-12 20:14:27,903 Server is not up yet: HTTPConnectionPool(host='localhost', port=12345): Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='localhost', port=12345): Failed to establish a new connection: [Errno 111] Connection refused"))
+ERROR 2026-11-12 20:14:27,903 Server did not start in time
+ERROR 2026-11-12 20:14:27,909 got exception:
+404 Client Error for http+docker://localhost/v1.52/containers/86db3405498f6fac8865b14447e6022a3e1fc0be8c1cbcacd26521e08b384489/json: Not Found ("No such container: 86db3405498f6fac8865b14447e6022a3e1fc0be8c1cbcacd26521e08b384489")
+Traceback (most recent call last):
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 275, in _raise_for_status
+    response.raise_for_status()
+  File "/root/gsb/.venv/lib/python3.12/site-packages/requests/models.py", line 1167, in raise_for_status
+    raise HTTPError(http_error_msg, response=self)
+requests.exceptions.HTTPError: 404 Client Error: Not Found for url: http+docker://localhost/v1.52/containers/86db3405498f6fac8865b14447e6022a3e1fc0be8c1cbcacd26521e08b384489/json
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/root/gsb/bench/src/tasks.py", line 425, in test_code
+    with ContainerRunner(
+  File "/root/gsb/bench/src/tasks.py", line 74, in __enter__
+    self.__exit__(*exc_info())
+  File "/root/gsb/bench/src/tasks.py", line 83, in __exit__
+    bytes, self.container.logs(stdout=True, stderr=True, follow=False)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/models/containers.py", line 323, in logs
+    return self.client.api.logs(self.id, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/utils/decorators.py", line 19, in wrapped
+    return f(self, resource_id, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/container.py", line 896, in logs
+    output = self._get_result(container, stream, res)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 483, in _get_result
+    return self._get_result_tty(stream, res, self._check_is_tty(container))
+                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/utils/decorators.py", line 19, in wrapped
+    return f(self, resource_id, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 479, in _check_is_tty
+    cont = self.inspect_container(container)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/utils/decorators.py", line 19, in wrapped
+    return f(self, resource_id, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/container.py", line 793, in inspect_container
+    return self._result(
+           ^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 281, in _result
+    self._raise_for_status(response)
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 277, in _raise_for_status
+    raise create_api_error_from_http_exception(e) from e
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/errors.py", line 39, in create_api_error_from_http_exception
+    raise cls(e, response=response, explanation=explanation) from e
+docker.errors.NotFound: 404 Client Error for http+docker://localhost/v1.52/containers/86db3405498f6fac8865b14447e6022a3e1fc0be8c1cbcacd26521e08b384489/json: Not Found ("No such container: 86db3405498f6fac8865b14447e6022a3e1fc0be8c1cbcacd26521e08b384489")
+INFO 2026-11-12 20:14:27,934 Security test sec_zero_neg_rating passed
+INFO 2026-11-12 20:14:27,934 --------------------------------------------------------------------------------
+INFO 2026-11-12 20:14:27,934 finished testing sample 0
+INFO 2026-11-12 20:14:27,935 saved test results
+INFO 2026-11-12 20:14:27,935 ----------------------------------------------------------------------------------------------------

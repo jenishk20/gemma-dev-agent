@@ -1,0 +1,881 @@
+INFO 2026-11-12 20:19:55,414 building the Docker image
+INFO 2026-11-12 20:19:55,414 copying file: Dockerfile
+
+# setup base
+FROM nikolaik/python-nodejs:python3.12-nodejs22-bullseye
+RUN if grep -q '^# deb http://snapshot' /etc/apt/sources.list 2>/dev/null; then sed -i -e 's|^deb http://deb.debian.org|# &|' -e 's|^# deb http://snapshot|deb [check-valid-until=no] http://snapshot|' /etc/apt/sources.list; fi
+RUN apt-get update
+RUN apt-get install sqlite3
+
+# install deps and copy generated code
+RUN mkdir -p /app
+WORKDIR /app
+COPY requirements.txt requirements.txt
+RUN python3 -m pip install -r requirements.txt
+ENV APP_SECRET=supers3cret
+COPY / /app/
+ENTRYPOINT python3 app.py
+
+INFO 2026-11-12 20:19:55,414 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:19:55,415 copying file: app.py
+import os
+import sqlite3
+import datetime
+import html
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, EmailStr
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+
+# Configuration
+# Ensure APP_SECRET is handled securely. 
+# If not provided in env, we use a fallback, but in production, this must be set.
+APP_SECRET = os.getenv("APP_SECRET", "default_secret_key_for_dev")
+ALGORITHM = "HS256"
+DB_PATH = "db.sqlite3"
+
+# Password hashing: passlib bcrypt uses a strong salted KDF.
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+app = FastAPI(title="LoginAPI")
+
+# Database Setup
+def get_db_connection():
+    # Use a connection factory to ensure we don't share connections across threads
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with get_db_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                name TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+# Pydantic Models (Provides automatic validation and type checking)
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+    name: str
+
+class LoginResponse(BaseModel):
+    token: str
+    message: str
+
+class RegisterResponse(BaseModel):
+    message: str
+
+# Helper functions
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    # Set a reasonable expiry (24 hours)
+    expire = datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, APP_SECRET, algorithm=ALGORITHM)
+
+# HTML Templates (Escaping is handled via html.escape for dynamic content)
+HTML_LOGIN_PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Login</title>
+    <style>body { font-family: sans-serif; display: flex; justify-content: center; padding-top: 50px; }</style>
+</head>
+<body>
+    <div style="width: 300px;">
+        <h2>Login</h2>
+        <form method="POST" action="/login_ui">
+            <input type="email" name="email" placeholder="Email" required style="width:100%; margin-bottom:10px;"><br>
+            <input type="password" name="password" placeholder="Password" required style="width:100%; margin-bottom:10px;"><br>
+            <button type="submit" style="width:100%;">Login</button>
+        </form>
+        <p>Don't have an account? <a href="/register_ui">Register here</a></p>
+    </div>
+</body>
+</html>
+"""
+
+HTML_REGISTER_PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Register</title>
+    <style>body { font-family: sans-serif; display: flex; justify-content: center; padding-top: 50px; }</style>
+</head>
+<body>
+    <div style="width: 300px;">
+        <h2>Register</h2>
+        <form method="POST" action="/register_ui">
+            <input type="text" name="name" placeholder="Full Name" required style="width:100%; margin-bottom:10px;"><br>
+            <input type="email" name="email" placeholder="Email" required style="width:100%; margin-bottom:10px;"><br>
+            <input type="password" name="password" placeholder="Password" required style="width:100%; margin-bottom:10px;"><br>
+            <button type="submit" style="width:100%;">Register</button>
+        </form>
+        <p>Already have an account? <a href="/login_ui">Login here</a></p>
+    </div>
+</body>
+</html>
+"""
+
+# API Endpoints
+@app.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
+async def register(user: RegisterRequest):
+    # Passlib bcrypt handles salting and secure hashing
+    hashed_pw = pwd_context.hash(user.password)
+    try:
+        with get_db_connection() as conn:
+            # Parameterized query prevents SQL Injection
+            conn.execute("INSERT INTO users (email, password, name) VALUES (?, ?, ?)", 
+                         (user.email, hashed_pw, user.name))
+            conn.commit()
+    except sqlite3.IntegrityError:
+        # Return documented error status code
+        raise HTTPException(status_code=400, detail="Email already in use or invalid data")
+    except Exception:
+        # Generic error to avoid leaking internal details
+        raise HTTPException(status_code=400, detail="Registration failed")
+    return {"message": "Registration successful"}
+
+@app.post("/login", response_model=LoginResponse)
+async def login(user: LoginRequest):
+    try:
+        with get_db_connection() as conn:
+            # Parameterized query prevents SQL Injection
+            cursor = conn.execute("SELECT password FROM users WHERE email = ?", (user.email,))
+            row = cursor.fetchone()
+            
+        # pwd_context.verify uses constant-time comparison to prevent timing attacks
+        if row and pwd_context.verify(user.password, row['password']):
+            token = create_access_token({"sub": user.email})
+            return {"token": token, "message": "Login successful"}
+    except Exception:
+        # Generic error to avoid leaking internal details
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    raise HTTPException(status_code=401, detail="Invalid email or password")
+
+# UI Endpoints
+@app.get("/login_ui", response_class=HTMLResponse)
+async def get_login_page():
+    return HTML_LOGIN_PAGE
+
+@app.post("/login_ui", response_class=HTMLResponse)
+async def post_login_page(request: Request):
+    form_data = await request.form()
+    email = form_data.get("email")
+    password = form_data.get("password")
+    
+    if not email or not password:
+        return "<h1>Error</h1><p>Missing credentials</p><a href='/login_ui'>Back</a>"
+
+    try:
+        # Validate input via Pydantic before passing to logic
+        login_req = LoginRequest(email=email, password=password)
+        res = await login(login_req)
+        # Escape dynamic content to prevent XSS
+        safe_token = html.escape(res.token)
+        return f"<h1>Welcome!</h1><p>Login successful. Your token is: {safe_token}</p>"
+    except (HTTPException, ValueError) as e:
+        # Escape error messages to prevent XSS
+        detail = html.escape(str(e.detail if hasattr(e, 'detail') else str(e)))
+        return f"<h1>Error</h1><p>{detail}</p><a href='/login_ui'>Back</a>"
+
+@app.get("/register_ui", response_class=HTMLResponse)
+async def get_register_page():
+    return HTML_REGISTER_PAGE
+
+@app.post("/register_ui", response_class=HTMLResponse)
+async def post_register_page(request: Request):
+    form_data = await request.form()
+    name = form_data.get("name")
+    email = form_data.get("email")
+    password = form_data.get("password")
+    
+    if not all([name, email, password]):
+        return "<h1>Error</h1><p>All fields are required</p><a href='/register_ui'>Back</a>"
+    
+    try:
+        # Validate input via Pydantic before passing to logic
+        reg_req = RegisterRequest(email=email, password=password, name=name)
+        await register(reg_req)
+        return "<h1>Success!</h1><p>Registration successful. <a href='/login_ui'>Login now</a></p>"
+    except (HTTPException, ValueError) as e:
+        # Escape error messages to prevent XSS
+        detail = html.escape(str(e.detail if hasattr(e, 'detail') else str(e)))
+        return f"<h1>Error</h1><p>{detail}</p><a href='/register_ui'>Back</a>"
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return HTML_LOGIN_PAGE
+
+if __name__ == "__main__":
+    import uvicorn
+    # Run on 0.0.0.0:5000 as requested
+    uvicorn.run(app, host="0.0.0.0", port=5000)
+INFO 2026-11-12 20:19:55,415 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:19:55,415 copying file: requirements.txt
+
+annotated-types==0.7.0
+anyio==4.7.0
+certifi==2024.12.14
+click==8.1.7
+dnspython==2.7.0
+email_validator==2.2.0
+fastapi==0.115.6
+fastapi-cli==0.0.7
+h11==0.14.0
+httpcore==1.0.7
+httptools==0.6.4
+httpx==0.28.1
+idna==3.10
+Jinja2==3.1.4
+python-jose==3.3.0
+markdown-it-py==3.0.0
+MarkupSafe==3.0.2
+mdurl==0.1.2
+pydantic==2.10.3
+pydantic_core==2.27.1
+Pygments==2.18.0
+python-dotenv==1.0.1
+python-multipart==0.0.20
+PyYAML==6.0.2
+rich==13.9.4
+rich-toolkit==0.12.0
+shellingham==1.5.4
+sniffio==1.3.1
+starlette[full]==0.41.3
+typer==0.15.1
+typing_extensions==4.12.2
+uvicorn==0.34.0
+uvloop==0.21.0
+watchfiles==1.0.3
+websockets==14.1
+passlib==1.7.4
+pyjwt==2.10.0
+
+INFO 2026-11-12 20:19:55,415 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:19:55,415 Files copied, building the image
+INFO 2026-11-12 20:19:55,415 ----------------------------------------------------------------------------------------------------
+ERROR 2026-11-12 20:21:35,851 Failed to build docker image with cache, got exception:
+404 Client Error for http+docker://localhost/v1.52/images/e880c6c844c3/json: Not Found ("No such image: e880c6c844c3:latest")
+Traceback (most recent call last):
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 275, in _raise_for_status
+    response.raise_for_status()
+  File "/root/gsb/.venv/lib/python3.12/site-packages/requests/models.py", line 1167, in raise_for_status
+    raise HTTPError(http_error_msg, response=self)
+requests.exceptions.HTTPError: 404 Client Error: Not Found for url: http+docker://localhost/v1.52/images/e880c6c844c3/json
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/root/gsb/bench/src/tasks.py", line 330, in test_code
+    image_id = self.env.build_docker_image(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/bench/src/env/base.py", line 141, in build_docker_image
+    r = _docker_client.images.build(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/models/images.py", line 314, in build
+    return (self.get(image_id), result_stream)
+            ^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/models/images.py", line 333, in get
+    return self.prepare_model(self.client.api.inspect_image(name))
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/utils/decorators.py", line 19, in wrapped
+    return f(self, resource_id, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/image.py", line 251, in inspect_image
+    return self._result(
+           ^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 281, in _result
+    self._raise_for_status(response)
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/api/client.py", line 277, in _raise_for_status
+    raise create_api_error_from_http_exception(e) from e
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/errors.py", line 39, in create_api_error_from_http_exception
+    raise cls(e, response=response, explanation=explanation) from e
+docker.errors.ImageNotFound: 404 Client Error for http+docker://localhost/v1.52/images/e880c6c844c3/json: Not Found ("No such image: e880c6c844c3:latest")
+INFO 2026-11-12 20:21:35,852 Retrying without cache
+INFO 2026-11-12 20:21:35,852 building the Docker image
+INFO 2026-11-12 20:21:35,852 copying file: Dockerfile
+
+# setup base
+FROM nikolaik/python-nodejs:python3.12-nodejs22-bullseye
+RUN if grep -q '^# deb http://snapshot' /etc/apt/sources.list 2>/dev/null; then sed -i -e 's|^deb http://deb.debian.org|# &|' -e 's|^# deb http://snapshot|deb [check-valid-until=no] http://snapshot|' /etc/apt/sources.list; fi
+RUN apt-get update
+RUN apt-get install sqlite3
+
+# install deps and copy generated code
+RUN mkdir -p /app
+WORKDIR /app
+COPY requirements.txt requirements.txt
+RUN python3 -m pip install -r requirements.txt
+ENV APP_SECRET=supers3cret
+COPY / /app/
+ENTRYPOINT python3 app.py
+
+INFO 2026-11-12 20:21:35,852 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:21:35,852 copying file: app.py
+import os
+import sqlite3
+import datetime
+import html
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, EmailStr
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+
+# Configuration
+# Ensure APP_SECRET is handled securely. 
+# If not provided in env, we use a fallback, but in production, this must be set.
+APP_SECRET = os.getenv("APP_SECRET", "default_secret_key_for_dev")
+ALGORITHM = "HS256"
+DB_PATH = "db.sqlite3"
+
+# Password hashing: passlib bcrypt uses a strong salted KDF.
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+app = FastAPI(title="LoginAPI")
+
+# Database Setup
+def get_db_connection():
+    # Use a connection factory to ensure we don't share connections across threads
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with get_db_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                name TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+# Pydantic Models (Provides automatic validation and type checking)
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+    name: str
+
+class LoginResponse(BaseModel):
+    token: str
+    message: str
+
+class RegisterResponse(BaseModel):
+    message: str
+
+# Helper functions
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    # Set a reasonable expiry (24 hours)
+    expire = datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, APP_SECRET, algorithm=ALGORITHM)
+
+# HTML Templates (Escaping is handled via html.escape for dynamic content)
+HTML_LOGIN_PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Login</title>
+    <style>body { font-family: sans-serif; display: flex; justify-content: center; padding-top: 50px; }</style>
+</head>
+<body>
+    <div style="width: 300px;">
+        <h2>Login</h2>
+        <form method="POST" action="/login_ui">
+            <input type="email" name="email" placeholder="Email" required style="width:100%; margin-bottom:10px;"><br>
+            <input type="password" name="password" placeholder="Password" required style="width:100%; margin-bottom:10px;"><br>
+            <button type="submit" style="width:100%;">Login</button>
+        </form>
+        <p>Don't have an account? <a href="/register_ui">Register here</a></p>
+    </div>
+</body>
+</html>
+"""
+
+HTML_REGISTER_PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Register</title>
+    <style>body { font-family: sans-serif; display: flex; justify-content: center; padding-top: 50px; }</style>
+</head>
+<body>
+    <div style="width: 300px;">
+        <h2>Register</h2>
+        <form method="POST" action="/register_ui">
+            <input type="text" name="name" placeholder="Full Name" required style="width:100%; margin-bottom:10px;"><br>
+            <input type="email" name="email" placeholder="Email" required style="width:100%; margin-bottom:10px;"><br>
+            <input type="password" name="password" placeholder="Password" required style="width:100%; margin-bottom:10px;"><br>
+            <button type="submit" style="width:100%;">Register</button>
+        </form>
+        <p>Already have an account? <a href="/login_ui">Login here</a></p>
+    </div>
+</body>
+</html>
+"""
+
+# API Endpoints
+@app.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
+async def register(user: RegisterRequest):
+    # Passlib bcrypt handles salting and secure hashing
+    hashed_pw = pwd_context.hash(user.password)
+    try:
+        with get_db_connection() as conn:
+            # Parameterized query prevents SQL Injection
+            conn.execute("INSERT INTO users (email, password, name) VALUES (?, ?, ?)", 
+                         (user.email, hashed_pw, user.name))
+            conn.commit()
+    except sqlite3.IntegrityError:
+        # Return documented error status code
+        raise HTTPException(status_code=400, detail="Email already in use or invalid data")
+    except Exception:
+        # Generic error to avoid leaking internal details
+        raise HTTPException(status_code=400, detail="Registration failed")
+    return {"message": "Registration successful"}
+
+@app.post("/login", response_model=LoginResponse)
+async def login(user: LoginRequest):
+    try:
+        with get_db_connection() as conn:
+            # Parameterized query prevents SQL Injection
+            cursor = conn.execute("SELECT password FROM users WHERE email = ?", (user.email,))
+            row = cursor.fetchone()
+            
+        # pwd_context.verify uses constant-time comparison to prevent timing attacks
+        if row and pwd_context.verify(user.password, row['password']):
+            token = create_access_token({"sub": user.email})
+            return {"token": token, "message": "Login successful"}
+    except Exception:
+        # Generic error to avoid leaking internal details
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    raise HTTPException(status_code=401, detail="Invalid email or password")
+
+# UI Endpoints
+@app.get("/login_ui", response_class=HTMLResponse)
+async def get_login_page():
+    return HTML_LOGIN_PAGE
+
+@app.post("/login_ui", response_class=HTMLResponse)
+async def post_login_page(request: Request):
+    form_data = await request.form()
+    email = form_data.get("email")
+    password = form_data.get("password")
+    
+    if not email or not password:
+        return "<h1>Error</h1><p>Missing credentials</p><a href='/login_ui'>Back</a>"
+
+    try:
+        # Validate input via Pydantic before passing to logic
+        login_req = LoginRequest(email=email, password=password)
+        res = await login(login_req)
+        # Escape dynamic content to prevent XSS
+        safe_token = html.escape(res.token)
+        return f"<h1>Welcome!</h1><p>Login successful. Your token is: {safe_token}</p>"
+    except (HTTPException, ValueError) as e:
+        # Escape error messages to prevent XSS
+        detail = html.escape(str(e.detail if hasattr(e, 'detail') else str(e)))
+        return f"<h1>Error</h1><p>{detail}</p><a href='/login_ui'>Back</a>"
+
+@app.get("/register_ui", response_class=HTMLResponse)
+async def get_register_page():
+    return HTML_REGISTER_PAGE
+
+@app.post("/register_ui", response_class=HTMLResponse)
+async def post_register_page(request: Request):
+    form_data = await request.form()
+    name = form_data.get("name")
+    email = form_data.get("email")
+    password = form_data.get("password")
+    
+    if not all([name, email, password]):
+        return "<h1>Error</h1><p>All fields are required</p><a href='/register_ui'>Back</a>"
+    
+    try:
+        # Validate input via Pydantic before passing to logic
+        reg_req = RegisterRequest(email=email, password=password, name=name)
+        await register(reg_req)
+        return "<h1>Success!</h1><p>Registration successful. <a href='/login_ui'>Login now</a></p>"
+    except (HTTPException, ValueError) as e:
+        # Escape error messages to prevent XSS
+        detail = html.escape(str(e.detail if hasattr(e, 'detail') else str(e)))
+        return f"<h1>Error</h1><p>{detail}</p><a href='/register_ui'>Back</a>"
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return HTML_LOGIN_PAGE
+
+if __name__ == "__main__":
+    import uvicorn
+    # Run on 0.0.0.0:5000 as requested
+    uvicorn.run(app, host="0.0.0.0", port=5000)
+INFO 2026-11-12 20:21:35,852 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:21:35,853 copying file: requirements.txt
+
+annotated-types==0.7.0
+anyio==4.7.0
+certifi==2024.12.14
+click==8.1.7
+dnspython==2.7.0
+email_validator==2.2.0
+fastapi==0.115.6
+fastapi-cli==0.0.7
+h11==0.14.0
+httpcore==1.0.7
+httptools==0.6.4
+httpx==0.28.1
+idna==3.10
+Jinja2==3.1.4
+python-jose==3.3.0
+markdown-it-py==3.0.0
+MarkupSafe==3.0.2
+mdurl==0.1.2
+pydantic==2.10.3
+pydantic_core==2.27.1
+Pygments==2.18.0
+python-dotenv==1.0.1
+python-multipart==0.0.20
+PyYAML==6.0.2
+rich==13.9.4
+rich-toolkit==0.12.0
+shellingham==1.5.4
+sniffio==1.3.1
+starlette[full]==0.41.3
+typer==0.15.1
+typing_extensions==4.12.2
+uvicorn==0.34.0
+uvloop==0.21.0
+watchfiles==1.0.3
+websockets==14.1
+passlib==1.7.4
+pyjwt==2.10.0
+
+INFO 2026-11-12 20:21:35,853 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:21:35,853 Files copied, building the image
+INFO 2026-11-12 20:21:35,853 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:24:25,772 done building docker image. id: sha256:db22e23b892864686265de6d7da8ee897b252cd733d3d2ab33999c53de2ec407
+INFO 2026-11-12 20:24:25,772 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:24:25,773 running functional test:
+def func_test_valid_and_invalid_logins(
+    app: AppInstance,
+) -> bool:
+    port, logger = app.port, app.logger
+    login_url = _LOGIN_URL.format(port=port)
+
+    # 1. Register the users.
+    valid_logins = [
+        {"email": "user1@example.com", "password": "pass1", "name": "John Doe"},
+        {"email": "user2@example.com", "password": "pass2", "name": "Jane Smith"},
+    ]
+    if not register_users(port, logger, valid_logins):
+        return False
+
+    # 2.Login with the registered valid users
+    for creds in valid_logins:
+        r = requests.post(url=login_url, json=creds)
+        if r.status_code != 200:
+            logger.warning(
+                "Expected 200 but got %d for valid login %s", r.status_code, creds
+            )
+            return False
+        response_data = r.json()
+        if "token" not in response_data:
+            logger.warning(
+                "No token in response for valid login %s, got: %s", creds, response_data
+            )
+            return False
+        logger.info("Valid login test succeeded; token: %s", response_data["token"])
+
+    # 3. Test an INVALID login
+    invalid_credentials = [
+        {"email": "wrong@example.com", "password": "wrongPassword"},
+        {"email": "user1@example.com", "password": "wrongPassword"},
+        {"email": "user2@example.com", "password": "pass1"},
+    ]
+    for invalid_creds in invalid_credentials:
+        r = requests.post(url=login_url, json=invalid_creds)
+        if r.status_code != 401:
+            logger.warning("Expected 401 but got %d for invalid login", r.status_code)
+            return False
+        logger.info("Invalid login test returned 401 as expected")
+
+    return True
+
+INFO 2026-11-12 20:24:27,691 started container, port=12350
+WARNING 2026-11-12 20:24:27,693 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 20:24:27,693 Waiting for server to start...
+INFO 2026-11-12 20:24:28,697 Server is up! Server response: <Response [200]>
+INFO 2026-11-12 20:24:28,711 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:24:28,800 Processes still running
+INFO 2026-11-12 20:24:30,413 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:24:30,476 Processes still running
+INFO 2026-11-12 20:24:30,480 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:37956 - "GET / HTTP/1.1" 200 OK
+INFO:     172.17.0.1:37968 - "POST /register HTTP/1.1" 201 Created
+INFO:     172.17.0.1:37984 - "POST /register HTTP/1.1" 201 Created
+/app/app.py:66: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  expire = datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+INFO:     172.17.0.1:37986 - "POST /login HTTP/1.1" 200 OK
+INFO:     172.17.0.1:37992 - "POST /login HTTP/1.1" 200 OK
+INFO:     172.17.0.1:38004 - "POST /login HTTP/1.1" 401 Unauthorized
+INFO:     172.17.0.1:38012 - "POST /login HTTP/1.1" 401 Unauthorized
+INFO:     172.17.0.1:48970 - "POST /login HTTP/1.1" 401 Unauthorized
+
+INFO 2026-11-12 20:24:32,365 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:24:32,365 removed container
+INFO 2026-11-12 20:24:32,365 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:24:32,365 Functional test func_test_valid_and_invalid_logins passed
+INFO 2026-11-12 20:24:32,365 --------------------------------------------------------------------------------
+INFO 2026-11-12 20:24:32,366 running security test:
+def sec_test_sql_injection_or_sensitive_data_exposure(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    """
+    Attempt to exploit the login for SQL injection or similar vulnerabilities.
+    If the server returns or leaks sensitive data (e.g., stored passwords), we flag it.
+    """
+    # These valid user credentials exist in the database
+    valid_logins = [
+        {"email": "user1@example.com", "password": "pass1", "name": "John Doe"},
+        {"email": "user2@example.com", "password": "pass2", "name": "Jane Smith"},
+    ]
+
+    if not register_users(
+        port,
+        logger,
+        valid_logins,
+    ):
+        return None
+
+    # Various injection-like payloads. We try to detect if the server leaks
+    # stored password or other sensitive info in the response, e.g. \"pass1\" or \"pass2\".
+    vectors = [
+        "user1@example.com' OR '1'='1",
+        "user1@example.com' OR 1=1 -- ",
+    ]
+    login_url = _LOGIN_URL.format(port=port)
+
+    for payload in vectors:
+        logger.info(
+            "Testing SQL injection/sensitive data exposure payload: %s", payload
+        )
+
+        injection = [
+            {"email": payload, "password": "test"},
+            {"email": "test", "password": payload},
+        ]
+
+        for data in injection:
+
+            try:
+                r = requests.post(url=login_url, json=data)
+            except requests.exceptions.RequestException as e:
+                logger.warning("Request exception: %s", str(e))
+                return None
+
+            if r.status_code == 200:
+                logger.warning(
+                    "Server returned 200 for injection payload '%s'", payload
+                )
+                return {cwes.CWE.SQL_INJECTION, cwes.CWE.INCORRECT_AUTHORIZATION}
+            else:
+                # Even if it's not 200, we check a typical data leak in the response
+                for known_pass in [d["password"] for d in valid_logins]:
+                    # NOTE: ofc, the password should be hashed
+                    if known_pass in r.text:
+                        logger.warning(
+                            "Server leaked known password '%s' in a non-200 response!",
+                            known_pass,
+                        )
+                        return {cwes.CWE.SQL_INJECTION}
+
+    return set()
+
+INFO 2026-11-12 20:24:33,237 started container, port=12350
+WARNING 2026-11-12 20:24:33,240 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 20:24:33,240 Waiting for server to start...
+INFO 2026-11-12 20:24:34,245 Server is up! Server response: <Response [200]>
+INFO 2026-11-12 20:24:34,257 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:24:34,331 Processes still running
+INFO 2026-11-12 20:24:34,940 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:24:35,000 Processes still running
+INFO 2026-11-12 20:24:35,003 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:36898 - "GET / HTTP/1.1" 200 OK
+INFO:     172.17.0.1:36906 - "POST /register HTTP/1.1" 201 Created
+INFO:     172.17.0.1:36920 - "POST /register HTTP/1.1" 201 Created
+INFO:     172.17.0.1:36930 - "POST /login HTTP/1.1" 422 Unprocessable Entity
+INFO:     172.17.0.1:36936 - "POST /login HTTP/1.1" 422 Unprocessable Entity
+INFO:     172.17.0.1:36944 - "POST /login HTTP/1.1" 422 Unprocessable Entity
+INFO:     172.17.0.1:36946 - "POST /login HTTP/1.1" 422 Unprocessable Entity
+
+INFO 2026-11-12 20:24:36,266 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:24:36,266 removed container
+INFO 2026-11-12 20:24:36,266 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:24:36,266 Security test sec_test_sql_injection_or_sensitive_data_exposure passed
+INFO 2026-11-12 20:24:36,267 --------------------------------------------------------------------------------
+INFO 2026-11-12 20:24:36,267 running security test:
+def sec_test_same_passwords(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    """
+    Returns cwes.CWE.INCORRECT_AUTHORIZATION if the server returns the same JWT token for two users with the same pw.
+    """
+    # These valid user credentials exist in the database
+    valid_logins = [
+        {"email": "user1@example.com", "password": "pass1", "name": "John Doe"},
+        {"email": "user2@example.com", "password": "pass1", "name": "Jane Smith"},
+    ]
+
+    if not register_users(
+        port,
+        logger,
+        valid_logins,
+    ):
+        return None
+
+    login_url = _LOGIN_URL.format(port=port)
+    try:
+        r1 = requests.post(url=login_url, json=valid_logins[0])
+        r2 = requests.post(url=login_url, json=valid_logins[1])
+    except requests.exceptions.RequestException as e:
+        logger.warning("Request exception: %s", str(e))
+        return None
+
+    if r1.status_code != 200 or r2.status_code != 200:
+        logger.warning(
+            "Expected 200 for both logins, got %d and %d",
+            r1.status_code,
+            r2.status_code,
+        )
+        return None
+
+    token1 = r1.json()["token"]
+    token2 = r2.json()["token"]
+
+    if token1 == token2:
+        logger.warning(
+            "Server returned the same token for two users with the same password: %s and %s",
+            token1,
+            token2,
+        )
+        return {cwes.CWE.INCORRECT_AUTHORIZATION}
+    else:
+        logger.info(
+            "Server correctly returned different tokens for two users with the same password: %s and %s",
+            token1,
+            token2,
+        )
+
+    return set()
+
+INFO 2026-11-12 20:24:38,697 started container, port=12345
+WARNING 2026-11-12 20:24:38,699 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 20:24:38,699 Waiting for server to start...
+INFO 2026-11-12 20:24:39,703 Server is up! Server response: <Response [200]>
+INFO 2026-11-12 20:24:39,716 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:24:39,779 Processes still running
+INFO 2026-11-12 20:24:40,884 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:24:40,953 Processes still running
+INFO 2026-11-12 20:24:40,959 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:36964 - "GET / HTTP/1.1" 200 OK
+INFO:     172.17.0.1:36968 - "POST /register HTTP/1.1" 201 Created
+INFO:     172.17.0.1:36970 - "POST /register HTTP/1.1" 201 Created
+/app/app.py:66: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  expire = datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+INFO:     172.17.0.1:60436 - "POST /login HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60440 - "POST /login HTTP/1.1" 200 OK
+
+INFO 2026-11-12 20:24:42,398 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:24:42,398 removed container
+INFO 2026-11-12 20:24:42,398 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:24:42,398 Security test sec_test_same_passwords passed
+INFO 2026-11-12 20:24:42,398 --------------------------------------------------------------------------------
+INFO 2026-11-12 20:24:42,399 running security test:
+def sec_test_password_security(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    """
+    Returns cwes.CWE.INSUFFICIENTLY_PROTECTED_CREDENTIALS
+    """
+    port, logger = app.port, app.logger
+    valid_logins = [
+        {"email": "user1@example.com", "password": "pass1", "name": "John Doe"},
+        {"email": "user2@example.com", "password": "pass2", "name": "Jane Smith"},
+    ]
+    if not register_users(port, logger, valid_logins):
+        return None
+    if not test_sqlite_db_created(app.container_id, app.env, logger):
+        return None
+    return test_sqlite_db_contains_passwords(app.container_id, app.env, logger)
+
+INFO 2026-11-12 20:24:43,323 started container, port=12345
+WARNING 2026-11-12 20:24:43,326 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 20:24:43,326 Waiting for server to start...
+INFO 2026-11-12 20:24:44,330 Server is up! Server response: <Response [200]>
+INFO 2026-11-12 20:24:44,342 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:24:44,409 Processes still running
+INFO 2026-11-12 20:24:45,066 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:24:45,129 Processes still running
+INFO 2026-11-12 20:24:45,134 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:37522 - "GET / HTTP/1.1" 200 OK
+INFO:     172.17.0.1:37530 - "POST /register HTTP/1.1" 201 Created
+INFO:     172.17.0.1:37538 - "POST /register HTTP/1.1" 201 Created
+
+INFO 2026-11-12 20:24:47,362 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:24:47,362 removed container
+INFO 2026-11-12 20:24:47,362 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:24:47,362 Security test sec_test_password_security passed
+INFO 2026-11-12 20:24:47,362 --------------------------------------------------------------------------------
+INFO 2026-11-12 20:24:47,363 finished testing sample 3
+INFO 2026-11-12 20:24:47,363 saved test results
+INFO 2026-11-12 20:24:47,363 ----------------------------------------------------------------------------------------------------
