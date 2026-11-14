@@ -28,4 +28,11 @@ N=${N:-10}
 C=${C:-8}
 echo "job $SLURM_JOB_ID on $(hostname) | submission=$SUB tasks=$N concurrency=$C | commit $(git rev-parse --short HEAD)"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
+# vLLM 0.19.1 is built with CUDA 12.9; drivers older than 575 need NVIDIA's compat libraries (see cluster/cuda_compat.sh).
+DRV=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | cut -d. -f1)
+if [ "$DRV" -lt 575 ]; then PYX=$GDA_ROOT/venv/bin/python source cluster/cuda_compat.sh; echo "driver $DRV < 575: CUDA 12.9 compat mode on ($CC_DIR)"; fi
+# 10-second GPU check before the multi-minute vLLM start, so a CUDA problem shows up right away with a clear message.
+"$GDA_ROOT/venv/bin/python" -c "
+import torch; x = torch.randn(256, 256, device='cuda'); torch.cuda.synchronize()
+print('GPU check ok:', torch.cuda.get_device_name(0), '| torch', torch.__version__, '| sum', round(float((x @ x).sum()), 2))"
 "$GDA_ROOT/venv/bin/python" tools/run_local_eval.py --submission "$SUB" --limit "$N" --concurrency "$C"
