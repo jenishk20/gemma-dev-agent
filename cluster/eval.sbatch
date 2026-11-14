@@ -14,6 +14,7 @@
 #SBATCH --output=gda-eval_%j.out
 set -eo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
+[ -f cluster/eval.sbatch ] || { echo "ERROR: run this from the repo folder: cd /scratch/\$USER/gemma-dev-agent && sbatch cluster/eval.sbatch"; exit 1; }
 export GDA_ROOT=${GDA_ROOT:-$(dirname "$PWD")/gda}   # next to the repo, e.g. /scratch/phalle.y/gda
 export VLLM_CONFIG_ROOT=$GDA_ROOT/cache/vllm-config
 export HF_HOME=$GDA_ROOT/cache/hf TRITON_CACHE_DIR=$GDA_ROOT/cache/triton XDG_CACHE_HOME=$GDA_ROOT/cache PYTHONUNBUFFERED=1 \

@@ -14,6 +14,8 @@
 #SBATCH --output=gda-setup_%j.out
 set -euo pipefail
 REPO=${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}
+[ -f "$REPO/cluster/setup.sh" ] || { echo "ERROR: run this from the repo folder: cd /scratch/\$USER/gemma-dev-agent && sbatch cluster/setup.sh"; exit 1; }
+echo "job ${SLURM_JOB_ID:-local} on $(hostname) started $(date)"
 GDA_ROOT=${GDA_ROOT:-$(dirname "$REPO")/gda}   # next to the repo, e.g. /scratch/phalle.y/gda
 MODELS=${MODELS:-gemma-4-e4b-it-qat-w4a16-ct}
 mkdir -p "$GDA_ROOT"/{data,models,wheelhouse,results,cache}
