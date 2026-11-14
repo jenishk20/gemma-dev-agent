@@ -14,7 +14,7 @@
 #SBATCH --output=gda-setup_%j.out
 set -euo pipefail
 REPO=${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}
-GDA_ROOT=${GDA_ROOT:-/scratch/$USER/gda}
+GDA_ROOT=${GDA_ROOT:-$(dirname "$REPO")/gda}   # next to the repo, e.g. /scratch/phalle.y/gda
 MODELS=${MODELS:-gemma-4-e4b-it-qat-w4a16-ct}
 mkdir -p "$GDA_ROOT"/{data,models,wheelhouse,results,cache}
 # Everything stays under $GDA_ROOT: nothing is written to $HOME.

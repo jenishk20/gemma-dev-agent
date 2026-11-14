@@ -21,7 +21,7 @@ from pathlib import Path
 
 import yaml
 
-ROOT = Path(os.environ.get("GDA_ROOT", f"/scratch/{os.environ.get('USER', 'user')}/gda"))
+ROOT = Path(os.environ.get("GDA_ROOT", Path(__file__).resolve().parents[2] / "gda"))  # next to the repo
 ALLOWED = {"gemma-4-31b-it-qat-w4a16-ct", "gemma-4-12b-it-qat-w4a16-ct",
            "gemma-4-e4b-it-qat-w4a16-ct", "gemma-4-e2b-it-qat-w4a16-ct"}
 EXTRA_ARGS = {"gemma-4-12b-it-qat-w4a16-ct": ("--hf-overrides", '{"architectures": ["Gemma4ForCausalLM"], "model_type": "gemma4"}')}

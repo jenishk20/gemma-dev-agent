@@ -14,7 +14,8 @@
 #SBATCH --output=gda-eval_%j.out
 set -eo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
-export GDA_ROOT=${GDA_ROOT:-/scratch/$USER/gda}
+export GDA_ROOT=${GDA_ROOT:-$(dirname "$PWD")/gda}   # next to the repo, e.g. /scratch/phalle.y/gda
+export VLLM_CONFIG_ROOT=$GDA_ROOT/cache/vllm-config
 export HF_HOME=$GDA_ROOT/cache/hf TRITON_CACHE_DIR=$GDA_ROOT/cache/triton XDG_CACHE_HOME=$GDA_ROOT/cache PYTHONUNBUFFERED=1 \
        VLLM_CACHE_ROOT=$GDA_ROOT/cache/vllm TORCHINDUCTOR_CACHE_DIR=$GDA_ROOT/cache/inductor UV_PYTHON_INSTALL_DIR=$GDA_ROOT/python
 SUB=${SUB:-submissions/e4b_baseline}
