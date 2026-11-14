@@ -13,8 +13,13 @@
 #SBATCH --job-name=gda-setup
 #SBATCH --output=gda-setup_%j.out
 set -euo pipefail
-REPO=${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}
-[ -f "$REPO/cluster/setup.sh" ] || { echo "ERROR: run this from the repo folder: cd /scratch/\$USER/gemma-dev-agent && sbatch cluster/setup.sh"; exit 1; }
+# Find the repo: this script's own folder (bash cluster/setup.sh), else the sbatch submit dir; never guess.
+HERE=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)
+if [ -n "${GDA_REPO:-}" ]; then REPO=$GDA_REPO
+elif [ -f "$HERE/cluster/setup.sh" ]; then REPO=$HERE
+elif [ -f "${SLURM_SUBMIT_DIR:-/nonexistent}/cluster/setup.sh" ]; then REPO=$SLURM_SUBMIT_DIR
+else echo "ERROR: cannot find the repo. Run: cd /scratch/\$USER/gemma-dev-agent && sbatch cluster/setup.sh"; exit 1; fi
+[ -f "$REPO/cluster/setup.sh" ] || { echo "ERROR: $REPO is not the gemma-dev-agent repo"; exit 1; }
 echo "job ${SLURM_JOB_ID:-local} on $(hostname) started $(date)"
 GDA_ROOT=${GDA_ROOT:-$(dirname "$REPO")/gda}   # next to the repo, e.g. /scratch/phalle.y/gda
 MODELS=${MODELS:-gemma-4-e4b-it-qat-w4a16-ct}
