@@ -17,14 +17,18 @@ REPO=${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}
 GDA_ROOT=${GDA_ROOT:-/scratch/$USER/gda}
 MODELS=${MODELS:-gemma-4-e4b-it-qat-w4a16-ct}
 mkdir -p "$GDA_ROOT"/{data,models,wheelhouse,results,cache}
-export UV_CACHE_DIR=$GDA_ROOT/cache/uv PIP_CACHE_DIR=$GDA_ROOT/cache/pip HF_HOME=$GDA_ROOT/cache/hf
+# Everything stays under $GDA_ROOT: nothing is written to $HOME.
+export UV_CACHE_DIR=$GDA_ROOT/cache/uv PIP_CACHE_DIR=$GDA_ROOT/cache/pip HF_HOME=$GDA_ROOT/cache/hf \
+       UV_PYTHON_INSTALL_DIR=$GDA_ROOT/python KAGGLE_CONFIG_DIR=$GDA_ROOT/cache/kaggle XDG_CACHE_HOME=$GDA_ROOT/cache
+mkdir -p "$KAGGLE_CONFIG_DIR"
+echo "repo: $REPO | all downloads and installs go to: $GDA_ROOT"
 
 [ -f "$REPO/.env" ] || { echo "Missing $REPO/.env. From the Mac: scp .env <you>@<cluster>:$REPO/"; exit 1; }
 export KAGGLE_API_TOKEN=$(grep '^KAGGLE_API_KEY=' "$REPO/.env" | cut -d= -f2- | tr -d "\"' ")
 
-# Python 3.13 (Kaggle's scorer runs 3.13) via uv, installed per-user, no root needed.
-command -v uv >/dev/null || python3 -m pip install --user -q uv
-export PATH=$HOME/.local/bin:$PATH
+# Python 3.13 (Kaggle's scorer runs 3.13) via uv; uv itself lives in a small bootstrap venv.
+[ -x "$GDA_ROOT/bootstrap/bin/uv" ] || { python3 -m venv "$GDA_ROOT/bootstrap" && "$GDA_ROOT/bootstrap/bin/pip" install -q uv; }
+export PATH=$GDA_ROOT/bootstrap/bin:$PATH
 uv python install 3.13
 [ -x "$GDA_ROOT/venv/bin/python" ] || uv venv --python 3.13 "$GDA_ROOT/venv"
 PY=$GDA_ROOT/venv/bin/python
