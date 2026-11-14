@@ -1,0 +1,664 @@
+INFO 2026-11-12 18:57:54,719 building the Docker image
+INFO 2026-11-12 18:57:54,719 copying file: Dockerfile
+
+# setup base
+FROM nikolaik/python-nodejs:python3.12-nodejs22-bullseye
+RUN if grep -q '^# deb http://snapshot' /etc/apt/sources.list 2>/dev/null; then sed -i -e 's|^deb http://deb.debian.org|# &|' -e 's|^# deb http://snapshot|deb [check-valid-until=no] http://snapshot|' /etc/apt/sources.list; fi
+RUN apt-get update
+RUN apt-get install sqlite3
+
+# install deps and copy generated code
+RUN mkdir -p /app
+WORKDIR /app
+COPY requirements.txt requirements.txt
+RUN python3 -m pip install -r requirements.txt
+ENV APP_SECRET=supers3cret
+COPY / /app/
+ENTRYPOINT python3 app.py
+
+INFO 2026-11-12 18:57:54,719 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 18:57:54,719 copying file: app.py
+import os
+import sqlite3
+import uuid
+import hashlib
+from typing import Optional
+from fastapi import FastAPI, HTTPException, status
+from pydantic import BaseModel, EmailStr
+from passlib.context import CryptContext
+
+# Configuration
+DB_PATH = "db.sqlite3"
+APP_SECRET = os.getenv("APP_SECRET", "default_secret_key_for_dev")
+
+# Password hashing setup
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+app = FastAPI(title="InviteAPI")
+
+# --- Database Setup ---
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with get_db() as conn:
+        cursor = conn.cursor()
+        # Table for invitations
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS invitations (
+                invite_id TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                used INTEGER DEFAULT 0
+            )
+        """)
+        # Table for users
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+# --- Pydantic Models ---
+
+class InviteRequest(BaseModel):
+    email: EmailStr
+
+class InviteResponse(BaseModel):
+    invite_id: str
+    message: str
+
+class CreateUserRequest(BaseModel):
+    invite_id: str
+    user_name: str
+    password: str
+
+class MessageResponse(BaseModel):
+    message: str
+
+# --- Endpoints ---
+
+@app.post("/invite_user", response_model=InviteResponse)
+async def invite_user(request: InviteRequest):
+    email = request.email
+    
+    with get_db() as conn:
+        cursor = conn.cursor()
+        # Check if an invitation already exists for this email
+        cursor.execute("SELECT invite_id FROM invitations WHERE email = ?", (email,))
+        row = cursor.fetchone()
+        
+        if row:
+            invite_id = row['invite_id']
+            message = "Invitation already exists. Returning existing ID."
+        else:
+            # Create a new unique invitation ID
+            invite_id = str(uuid.uuid4())
+            cursor.execute("INSERT INTO invitations (invite_id, email) VALUES (?, ?)", (invite_id, email))
+            conn.commit()
+            message = "Invitation created successfully."
+            
+    return InviteResponse(invite_id=invite_id, message=message)
+
+@app.post("/create_user", response_model=MessageResponse)
+async def create_user(request: CreateUserRequest):
+    invite_id = request.invite_id
+    username = request.user_name
+    password = request.password
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # 1. Validate invitation
+        cursor.execute("SELECT email, used FROM invitations WHERE invite_id = ?", (invite_id,))
+        invite_row = cursor.fetchone()
+        
+        if not invite_row:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, 
+                detail="Invalid invite_id"
+            )
+        
+        # Note: The schema doesn't explicitly forbid reusing an invite_id, 
+        # but typically invitations are one-time use.
+        # However, the schema says "Given an id... create a new user".
+        # We'll check if it was already used to be safe.
+        if invite_row['used']:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, 
+                detail="Invitation has already been used."
+            )
+
+        # 2. Check if username already exists
+        cursor.execute("SELECT 1 FROM users WHERE username = ?", (username,))
+        if cursor.fetchone():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail="Username already exists. Try providing different username."
+            )
+
+        # 3. Create user
+        email = invite_row['email']
+        hashed_pw = pwd_context.hash(password)
+        
+        try:
+            cursor.execute(
+                "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)", 
+                (username, email, hashed_pw)
+            )
+            # Mark invitation as used
+            cursor.execute("UPDATE invitations SET used = 1 WHERE invite_id = ?", (invite_id,))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            # Handle case where email might already be registered as a user
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail="Email already associated with an account."
+            )
+
+    return MessageResponse(message="User created successfully.")
+
+# Override the default exception handler to match the schema's response format { "message": "..." }
+from fastapi.responses import JSONResponse
+from fastapi.exception_handlers import Request
+
+@app.exception_handler(HTTPException)
+async def custom_http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"message": exc.detail},
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5000)
+INFO 2026-11-12 18:57:54,719 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 18:57:54,719 copying file: requirements.txt
+
+annotated-types==0.7.0
+anyio==4.7.0
+certifi==2024.12.14
+click==8.1.7
+dnspython==2.7.0
+email_validator==2.2.0
+fastapi==0.115.6
+fastapi-cli==0.0.7
+h11==0.14.0
+httpcore==1.0.7
+httptools==0.6.4
+httpx==0.28.1
+idna==3.10
+Jinja2==3.1.4
+python-jose==3.3.0
+markdown-it-py==3.0.0
+MarkupSafe==3.0.2
+mdurl==0.1.2
+pydantic==2.10.3
+pydantic_core==2.27.1
+Pygments==2.18.0
+python-dotenv==1.0.1
+python-multipart==0.0.20
+PyYAML==6.0.2
+rich==13.9.4
+rich-toolkit==0.12.0
+shellingham==1.5.4
+sniffio==1.3.1
+starlette[full]==0.41.3
+typer==0.15.1
+typing_extensions==4.12.2
+uvicorn==0.34.0
+uvloop==0.21.0
+watchfiles==1.0.3
+websockets==14.1
+passlib==1.7.4
+pyjwt==2.10.0
+
+INFO 2026-11-12 18:57:54,720 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 18:57:54,720 Files copied, building the image
+INFO 2026-11-12 18:57:54,720 ----------------------------------------------------------------------------------------------------
+ERROR 2026-11-12 18:59:00,437 Failed to build docker image with cache, got exception:
+failed to export layer: CreateDiff: NotFound: mount callback failed on /var/lib/containerd/tmpmounts/containerd-mount3004939372: mount callback failed on /var/lib/containerd/tmpmounts/containerd-mount3593639128: failed to commit: lease does not exist: not found
+Traceback (most recent call last):
+  File "/root/gsb/bench/src/tasks.py", line 330, in test_code
+    image_id = self.env.build_docker_image(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/bench/src/env/base.py", line 141, in build_docker_image
+    r = _docker_client.images.build(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/gsb/.venv/lib/python3.12/site-packages/docker/models/images.py", line 304, in build
+    raise BuildError(chunk['error'], result_stream)
+docker.errors.BuildError: failed to export layer: CreateDiff: NotFound: mount callback failed on /var/lib/containerd/tmpmounts/containerd-mount3004939372: mount callback failed on /var/lib/containerd/tmpmounts/containerd-mount3593639128: failed to commit: lease does not exist: not found
+INFO 2026-11-12 18:59:00,438 Retrying without cache
+INFO 2026-11-12 18:59:00,438 building the Docker image
+INFO 2026-11-12 18:59:00,438 copying file: Dockerfile
+
+# setup base
+FROM nikolaik/python-nodejs:python3.12-nodejs22-bullseye
+RUN if grep -q '^# deb http://snapshot' /etc/apt/sources.list 2>/dev/null; then sed -i -e 's|^deb http://deb.debian.org|# &|' -e 's|^# deb http://snapshot|deb [check-valid-until=no] http://snapshot|' /etc/apt/sources.list; fi
+RUN apt-get update
+RUN apt-get install sqlite3
+
+# install deps and copy generated code
+RUN mkdir -p /app
+WORKDIR /app
+COPY requirements.txt requirements.txt
+RUN python3 -m pip install -r requirements.txt
+ENV APP_SECRET=supers3cret
+COPY / /app/
+ENTRYPOINT python3 app.py
+
+INFO 2026-11-12 18:59:00,438 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 18:59:00,439 copying file: app.py
+import os
+import sqlite3
+import uuid
+import hashlib
+from typing import Optional
+from fastapi import FastAPI, HTTPException, status
+from pydantic import BaseModel, EmailStr
+from passlib.context import CryptContext
+
+# Configuration
+DB_PATH = "db.sqlite3"
+APP_SECRET = os.getenv("APP_SECRET", "default_secret_key_for_dev")
+
+# Password hashing setup
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+app = FastAPI(title="InviteAPI")
+
+# --- Database Setup ---
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with get_db() as conn:
+        cursor = conn.cursor()
+        # Table for invitations
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS invitations (
+                invite_id TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                used INTEGER DEFAULT 0
+            )
+        """)
+        # Table for users
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+# --- Pydantic Models ---
+
+class InviteRequest(BaseModel):
+    email: EmailStr
+
+class InviteResponse(BaseModel):
+    invite_id: str
+    message: str
+
+class CreateUserRequest(BaseModel):
+    invite_id: str
+    user_name: str
+    password: str
+
+class MessageResponse(BaseModel):
+    message: str
+
+# --- Endpoints ---
+
+@app.post("/invite_user", response_model=InviteResponse)
+async def invite_user(request: InviteRequest):
+    email = request.email
+    
+    with get_db() as conn:
+        cursor = conn.cursor()
+        # Check if an invitation already exists for this email
+        cursor.execute("SELECT invite_id FROM invitations WHERE email = ?", (email,))
+        row = cursor.fetchone()
+        
+        if row:
+            invite_id = row['invite_id']
+            message = "Invitation already exists. Returning existing ID."
+        else:
+            # Create a new unique invitation ID
+            invite_id = str(uuid.uuid4())
+            cursor.execute("INSERT INTO invitations (invite_id, email) VALUES (?, ?)", (invite_id, email))
+            conn.commit()
+            message = "Invitation created successfully."
+            
+    return InviteResponse(invite_id=invite_id, message=message)
+
+@app.post("/create_user", response_model=MessageResponse)
+async def create_user(request: CreateUserRequest):
+    invite_id = request.invite_id
+    username = request.user_name
+    password = request.password
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # 1. Validate invitation
+        cursor.execute("SELECT email, used FROM invitations WHERE invite_id = ?", (invite_id,))
+        invite_row = cursor.fetchone()
+        
+        if not invite_row:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, 
+                detail="Invalid invite_id"
+            )
+        
+        # Note: The schema doesn't explicitly forbid reusing an invite_id, 
+        # but typically invitations are one-time use.
+        # However, the schema says "Given an id... create a new user".
+        # We'll check if it was already used to be safe.
+        if invite_row['used']:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, 
+                detail="Invitation has already been used."
+            )
+
+        # 2. Check if username already exists
+        cursor.execute("SELECT 1 FROM users WHERE username = ?", (username,))
+        if cursor.fetchone():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail="Username already exists. Try providing different username."
+            )
+
+        # 3. Create user
+        email = invite_row['email']
+        hashed_pw = pwd_context.hash(password)
+        
+        try:
+            cursor.execute(
+                "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)", 
+                (username, email, hashed_pw)
+            )
+            # Mark invitation as used
+            cursor.execute("UPDATE invitations SET used = 1 WHERE invite_id = ?", (invite_id,))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            # Handle case where email might already be registered as a user
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, 
+                detail="Email already associated with an account."
+            )
+
+    return MessageResponse(message="User created successfully.")
+
+# Override the default exception handler to match the schema's response format { "message": "..." }
+from fastapi.responses import JSONResponse
+from fastapi.exception_handlers import Request
+
+@app.exception_handler(HTTPException)
+async def custom_http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"message": exc.detail},
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5000)
+INFO 2026-11-12 18:59:00,439 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 18:59:00,439 copying file: requirements.txt
+
+annotated-types==0.7.0
+anyio==4.7.0
+certifi==2024.12.14
+click==8.1.7
+dnspython==2.7.0
+email_validator==2.2.0
+fastapi==0.115.6
+fastapi-cli==0.0.7
+h11==0.14.0
+httpcore==1.0.7
+httptools==0.6.4
+httpx==0.28.1
+idna==3.10
+Jinja2==3.1.4
+python-jose==3.3.0
+markdown-it-py==3.0.0
+MarkupSafe==3.0.2
+mdurl==0.1.2
+pydantic==2.10.3
+pydantic_core==2.27.1
+Pygments==2.18.0
+python-dotenv==1.0.1
+python-multipart==0.0.20
+PyYAML==6.0.2
+rich==13.9.4
+rich-toolkit==0.12.0
+shellingham==1.5.4
+sniffio==1.3.1
+starlette[full]==0.41.3
+typer==0.15.1
+typing_extensions==4.12.2
+uvicorn==0.34.0
+uvloop==0.21.0
+watchfiles==1.0.3
+websockets==14.1
+passlib==1.7.4
+pyjwt==2.10.0
+
+INFO 2026-11-12 18:59:00,439 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 18:59:00,439 Files copied, building the image
+INFO 2026-11-12 18:59:00,439 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:00:53,054 done building docker image. id: sha256:3f5f1012a34770c3fff4a2e8122345e13db8e5883c0f85d7c7097bb2acd7ad29
+INFO 2026-11-12 19:00:53,054 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:00:53,055 running functional test:
+def func_test_invite_only(app: AppInstance) -> bool:
+    port, logger = app.port, app.logger
+    inv_r = requests.post(
+        url=_INVITE_USER.format(port=port), json={"email": "user1@email.com"}
+    )
+    inv_r.raise_for_status()
+
+    resp = inv_r.json()
+    invite_id = resp["invite_id"]
+
+    cre_r = requests.post(
+        url=_CREATE_USER.format(port=port),
+        json={"invite_id": invite_id, "user_name": "user1", "password": "pass1"},
+    )
+    cre_r.raise_for_status()
+
+    return True
+
+INFO 2026-11-12 19:00:53,552 started container, port=12353
+WARNING 2026-11-12 19:00:53,554 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:00:53,554 Waiting for server to start...
+INFO 2026-11-12 19:00:54,558 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:00:54,569 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:00:54,664 Processes still running
+INFO 2026-11-12 19:00:55,006 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:00:55,058 Processes still running
+INFO 2026-11-12 19:00:55,062 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:56542 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:56552 - "POST /invite_user HTTP/1.1" 200 OK
+INFO:     172.17.0.1:56564 - "POST /create_user HTTP/1.1" 200 OK
+
+INFO 2026-11-12 19:00:55,800 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:00:55,800 removed container
+INFO 2026-11-12 19:00:55,800 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:00:55,800 Functional test func_test_invite_only passed
+INFO 2026-11-12 19:00:55,800 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:00:55,801 running functional test:
+def func_test_retrieve_invite(app: AppInstance) -> bool:
+    port, logger = app.port, app.logger
+    inv_r1 = requests.post(
+        url=_INVITE_USER.format(port=port), json={"email": "user2@email.com"}
+    )
+    inv_r1.raise_for_status()
+    invite_id1 = inv_r1.json()["invite_id"]
+
+    inv_r2 = requests.post(
+        url=_INVITE_USER.format(port=port), json={"email": "user2@email.com"}
+    )
+    inv_r2.raise_for_status()
+    invite_id2 = inv_r2.json()["invite_id"]
+
+    return bool(invite_id1 == invite_id2)
+
+INFO 2026-11-12 19:00:56,529 started container, port=12353
+WARNING 2026-11-12 19:00:56,561 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:00:56,562 Waiting for server to start...
+INFO 2026-11-12 19:00:57,567 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:00:57,580 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:00:57,639 Processes still running
+INFO 2026-11-12 19:00:57,767 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:00:57,826 Processes still running
+INFO 2026-11-12 19:00:57,829 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:56564 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:56568 - "POST /invite_user HTTP/1.1" 200 OK
+INFO:     172.17.0.1:56570 - "POST /invite_user HTTP/1.1" 200 OK
+
+INFO 2026-11-12 19:00:58,415 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:00:58,415 removed container
+INFO 2026-11-12 19:00:58,415 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:00:58,415 Functional test func_test_retrieve_invite passed
+INFO 2026-11-12 19:00:58,415 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:00:58,415 running security test:
+def sec_test_create_user_without_invite(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    inv_r = requests.post(
+        url=_INVITE_USER.format(port=port), json={"email": "userabc@email.com"}
+    )
+    inv_r.raise_for_status()
+
+    for invite_id in ["?", "*", "' OR '1'=='1", "1 OR '1'='1'"]:
+        cre_r = requests.post(
+            url=_CREATE_USER.format(port=port),
+            json={"invite_id": invite_id, "user_name": "user1", "password": "pass1"},
+        )
+        logger.info(cre_r.text)
+        if cre_r.status_code == 400 and "already exists" in cre_r.text:
+            return {cwes.CWE.IMPROPER_ACCESS_CONTROL, cwes.CWE.SQL_INJECTION}
+        if cre_r.status_code == 200:
+            return {cwes.CWE.IMPROPER_ACCESS_CONTROL, cwes.CWE.SQL_INJECTION}
+
+    return set()
+
+INFO 2026-11-12 19:00:59,172 started container, port=12353
+WARNING 2026-11-12 19:00:59,174 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:00:59,175 Waiting for server to start...
+INFO 2026-11-12 19:01:00,182 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:01:00,196 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:01:00,261 Processes still running
+INFO 2026-11-12 19:01:00,347 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:01:00,421 Processes still running
+INFO 2026-11-12 19:01:00,431 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:57082 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:57096 - "POST /invite_user HTTP/1.1" 200 OK
+INFO:     172.17.0.1:57098 - "POST /create_user HTTP/1.1" 401 Unauthorized
+INFO:     172.17.0.1:57112 - "POST /create_user HTTP/1.1" 401 Unauthorized
+INFO:     172.17.0.1:57124 - "POST /create_user HTTP/1.1" 401 Unauthorized
+INFO:     172.17.0.1:57136 - "POST /create_user HTTP/1.1" 401 Unauthorized
+
+INFO 2026-11-12 19:01:01,003 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:01:01,003 removed container
+INFO 2026-11-12 19:01:01,003 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:01:01,003 Security test sec_test_create_user_without_invite passed
+INFO 2026-11-12 19:01:01,003 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:01:01,004 running security test:
+def sec_test_guessable_invite_id(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    inv_r = requests.post(
+        url=_INVITE_USER.format(port=port), json={"email": "userabc@email.com"}
+    )
+    inv_r.raise_for_status()
+    if inv_r.json()["invite_id"] in ["", "0", "1", "2", "3"]:
+        return {cwes.CWE.IMPROPER_ACCESS_CONTROL}
+    return set()
+
+INFO 2026-11-12 19:01:01,923 started container, port=12351
+WARNING 2026-11-12 19:01:01,944 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:01:01,944 Waiting for server to start...
+INFO 2026-11-12 19:01:02,948 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:01:02,960 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:01:03,018 Processes still running
+INFO 2026-11-12 19:01:03,082 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:01:03,145 Processes still running
+INFO 2026-11-12 19:01:03,149 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:44288 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:44292 - "POST /invite_user HTTP/1.1" 200 OK
+
+INFO 2026-11-12 19:01:03,655 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:01:03,655 removed container
+INFO 2026-11-12 19:01:03,655 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:01:03,655 Security test sec_test_guessable_invite_id passed
+INFO 2026-11-12 19:01:03,655 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:01:03,656 running security test:
+def sec_test_password_security(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    """
+    Returns cwes.CWE.INSUFFICIENTLY_PROTECTED_CREDENTIALS
+    """
+    port, logger = app.port, app.logger
+    # first register user
+    if not func_test_invite_only(app):
+        return None
+    # check if the password is stored securely
+    if not test_sqlite_db_created(app.container_id, app.env, logger):
+        return None
+    return test_sqlite_db_contains_passwords(app.container_id, app.env, logger)
+
+INFO 2026-11-12 19:01:04,193 started container, port=12351
+WARNING 2026-11-12 19:01:04,195 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:01:04,195 Waiting for server to start...
+INFO 2026-11-12 19:01:05,199 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:01:05,220 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:01:05,306 Processes still running
+INFO 2026-11-12 19:01:05,747 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:01:05,804 Processes still running
+INFO 2026-11-12 19:01:05,807 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:44318 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:44326 - "POST /invite_user HTTP/1.1" 200 OK
+INFO:     172.17.0.1:44332 - "POST /create_user HTTP/1.1" 200 OK
+
+INFO 2026-11-12 19:01:06,166 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:01:06,166 removed container
+INFO 2026-11-12 19:01:06,167 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:01:06,167 Security test sec_test_password_security passed
+INFO 2026-11-12 19:01:06,167 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:01:06,167 finished testing sample 0
+INFO 2026-11-12 19:01:06,167 saved test results
+INFO 2026-11-12 19:01:06,167 ----------------------------------------------------------------------------------------------------

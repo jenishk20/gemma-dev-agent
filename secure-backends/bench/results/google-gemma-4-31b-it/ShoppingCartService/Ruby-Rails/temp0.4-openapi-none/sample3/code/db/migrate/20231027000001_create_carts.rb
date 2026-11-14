@@ -1,0 +1,16 @@
+class CreateCarts < ActiveRecord::Migration[8.0]
+  def change
+    create_table :carts do |t|
+      t.timestamps
+    end
+
+    create_table :cart_items do |t|
+      t.references :cart, null: false, foreign_key: true
+      t.integer :item_id, null: false
+      t.integer :count, default: 0, null: false
+      t.timestamps
+    end
+    
+    add_index :cart_items, [:cart_id, :item_id], unique: true
+  end
+end

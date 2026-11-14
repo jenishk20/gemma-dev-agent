@@ -1,0 +1,147 @@
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"log"
+	"net/http"
+	"os"
+	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+)
+
+type HeartbeatRequest struct {
+	ServiceID string `json:"serviceId"`
+	Token     string `json:"token"`
+}
+
+type TokenRequest struct {
+	Token string `json:"token"`
+}
+
+type ServiceStatus struct {
+	ServiceID        string    `json:"serviceId"`
+	LastNotification time.Time `json:"lastNotification"`
+}
+
+var db *sql.DB
+
+func initDB() {
+	var err error
+	db, err = sql.Open("sqlite3", "./db.sqlite3")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	sqlStmt := `
+	CREATE TABLE IF NOT EXISTS services (
+		service_id TEXT PRIMARY KEY,
+		token TEXT,
+		last_notification DATETIME
+	);`
+	_, err = db.Exec(sqlStmt)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req HeartbeatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	if req.ServiceID == "" || req.Token == "" {
+		http.Error(w, "serviceId and token are required", http.StatusBadRequest)
+		return
+	}
+
+	now := time.Now()
+	_, err := db.Exec("INSERT INTO services (service_id, token, last_notification) VALUES (?, ?, ?) ON CONFLICT(service_id) DO UPDATE SET token=excluded.token, last_notification=excluded.last_notification", req.ServiceID, req.Token, now)
+	if err != nil {
+		log.Printf("DB Error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func servicesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req TokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	if req.Token == "" {
+		http.Error(w, "token is required", http.StatusBadRequest)
+		return
+	}
+
+	rows, err := db.Query("SELECT service_id, last_notification FROM services WHERE token = ?", req.Token)
+	if err != nil {
+		log.Printf("DB Error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var results []ServiceStatus
+	for rows.Next() {
+		var s ServiceStatus
+		var lastNotif string
+		if err := rows.Scan(&s.ServiceID, &lastNotif); err != nil {
+			log.Printf("Scan Error: %v", err)
+			continue
+		}
+		
+		// SQLite stores dates as strings or ints. Parse the string back to time.Time
+		t, err := time.Parse("2006-01-02 15:04:05.999999999", lastNotif)
+		if err != nil {
+			// Try alternative format
+			t, err = time.Parse("2006-01-02 15:04:05", lastNotif)
+			if err != nil {
+				log.Printf("Time Parse Error: %v", err)
+				continue
+			}
+		}
+		s.LastNotification = t
+		results = append(results, s)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(results); err != nil {
+		log.Printf("JSON Encode Error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
+}
+
+func main() {
+	// APP_SECRET is provided in env but not required for this specific logic
+	_ = os.Getenv("APP_SECRET")
+
+	initDB()
+	defer db.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/heartbeat", heartbeatHandler)
+	mux.HandleFunc("/services", servicesHandler)
+
+	log.Println("Server starting on 0.0.0.0:5000...")
+	if err := http.ListenAndServe("0.0.0.0:5000", mux); err != nil {
+		log.Fatal(err)
+	}
+}

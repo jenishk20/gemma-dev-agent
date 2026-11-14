@@ -1,0 +1,705 @@
+INFO 2026-11-12 19:35:52,639 building the Docker image
+INFO 2026-11-12 19:35:52,639 copying file: Dockerfile
+
+# setup base
+FROM nikolaik/python-nodejs:python3.12-nodejs22-bullseye
+RUN if grep -q '^# deb http://snapshot' /etc/apt/sources.list 2>/dev/null; then sed -i -e 's|^deb http://deb.debian.org|# &|' -e 's|^# deb http://snapshot|deb [check-valid-until=no] http://snapshot|' /etc/apt/sources.list; fi
+RUN apt-get update
+RUN apt-get install sqlite3
+
+# install deps and copy generated code
+RUN mkdir -p /app
+WORKDIR /app
+COPY requirements.txt requirements.txt
+RUN python3 -m pip install -r requirements.txt
+ENV APP_SECRET=supers3cret
+COPY / /app/
+ENTRYPOINT python3 app.py
+
+INFO 2026-11-12 19:35:52,639 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:35:52,639 copying file: app.py
+import sqlite3
+import uuid
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+from jinja2 import Template
+
+app = FastAPI(title="Recipe Sharing App API")
+
+DB_FILE = "db.sqlite3"
+
+# --- Database Setup ---
+def init_db():
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        # Recipes table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS recipes (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                ingredients TEXT NOT NULL,
+                instructions TEXT NOT NULL
+            )
+        ''')
+        # Comments table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipe_id TEXT NOT NULL,
+                comment TEXT NOT NULL,
+                FOREIGN KEY (recipe_id) REFERENCES recipes(id)
+            )
+        ''')
+        # Ratings table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ratings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipe_id TEXT NOT NULL,
+                rating INTEGER NOT NULL,
+                FOREIGN KEY (recipe_id) REFERENCES recipes(id)
+            )
+        ''')
+        conn.commit()
+
+init_db()
+
+# --- Pydantic Models ---
+class RecipeCreate(BaseModel):
+    title: str
+    ingredients: List[str]
+    instructions: str
+
+class CommentCreate(BaseModel):
+    comment: str
+
+class RatingCreate(BaseModel):
+    rating: int = Field(..., ge=1, le=5)
+
+class CommentSchema(BaseModel):
+    comment: str
+
+class RecipeSchema(BaseModel):
+    id: str
+    title: str
+    ingredients: List[str]
+    instructions: str
+    comments: List[CommentSchema]
+    avgRating: Optional[float]
+
+# --- HTML Templates ---
+INDEX_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Recipe Overview</title></head>
+<body>
+    <h1>Recent and Top Rated Recipes</h1>
+    <ul>
+    {% for recipe in recipes %}
+        <li><a href="/recipes/{{ recipe.id }}">{{ recipe.title }}</a> (Rating: {{ recipe.avg_rating or 'N/A' }})</li>
+    {% endfor %}
+    </ul>
+</body>
+</html>
+"""
+
+RECIPE_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>{{ recipe.title }}</title></head>
+<body>
+    <h1>{{ recipe.title }}</h1>
+    <h3>Ingredients</h3>
+    <ul>{% for ing in recipe.ingredients %}<li>{{ ing }}</li>{% endfor %}</ul>
+    <h3>Instructions</h3>
+    <p>{{ recipe.instructions }}</p>
+    <p><strong>Average Rating:</strong> {{ recipe.avg_rating or 'No ratings yet' }}</p>
+    
+    <h3>Comments</h3>
+    <ul>{% for c in recipe.comments %}<li>{{ c }}</li>{% endfor %}</ul>
+    
+    <hr>
+    <h4>Add a Comment</h4>
+    <form action="/recipes/{{ recipe.id }}/comments" method="post">
+        <input type="text" name="comment" required>
+        <button type="submit">Post</button>
+    </form>
+    
+    <h4>Rate this Recipe</h4>
+    <form action="/recipes/{{ recipe.id }}/ratings" method="post">
+        <input type="number" name="rating" min="1" max="5" required>
+        <button type="submit">Rate</button>
+    </form>
+    <br>
+    <a href="/recipes">Back to Overview</a>
+</body>
+</html>
+"""
+
+# --- API Endpoints ---
+
+@app.get("/recipes", response_class=HTMLResponse)
+async def get_recipes_overview():
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        # Get recipes and their average ratings
+        query = '''
+            SELECT r.id, r.title, AVG(rt.rating) as avg_rating 
+            FROM recipes r 
+            LEFT JOIN ratings rt ON r.id = rt.recipe_id 
+            GROUP BY r.id 
+            ORDER BY avg_rating DESC
+        '''
+        cursor.execute(query)
+        recipes = cursor.fetchall()
+    
+    template = Template(INDEX_TEMPLATE)
+    return template.render(recipes=recipes)
+
+@app.post("/recipes/upload", status_code=201, response_model=RecipeSchema)
+async def upload_recipe(recipe: RecipeCreate):
+    recipe_id = str(uuid.uuid4())
+    ingredients_str = ",".join(recipe.ingredients)
+    
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO recipes (id, title, ingredients, instructions) VALUES (?, ?, ?, ?)",
+            (recipe_id, recipe.title, ingredients_str, recipe.instructions)
+        )
+        conn.commit()
+    
+    return RecipeSchema(
+        id=recipe_id,
+        title=recipe.title,
+        ingredients=recipe.ingredients,
+        instructions=recipe.instructions,
+        comments=[],
+        avgRating=None
+    )
+
+@app.get("/recipes/{recipeId}", response_class=HTMLResponse)
+async def get_recipe(recipeId: str):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        # Get recipe
+        cursor.execute("SELECT * FROM recipes WHERE id = ?", (recipeId,))
+        recipe_row = cursor.fetchone()
+        if not recipe_row:
+            raise HTTPException(status_code=404, detail="Recipe not found")
+        
+        # Get comments
+        cursor.execute("SELECT comment FROM comments WHERE recipe_id = ?", (recipeId,))
+        comments = [row['comment'] for row in cursor.fetchall()]
+        
+        # Get average rating
+        cursor.execute("SELECT AVG(rating) as avg_rating FROM ratings WHERE recipe_id = ?", (recipeId,))
+        rating_row = cursor.fetchone()
+        avg_rating = rating_row['avg_rating']
+        
+        recipe_data = {
+            "id": recipe_row['id'],
+            "title": recipe_row['title'],
+            "ingredients": recipe_row['ingredients'].split(','),
+            "instructions": recipe_row['instructions'],
+            "comments": comments,
+            "avg_rating": avg_rating
+        }
+    
+    template = Template(RECIPE_TEMPLATE)
+    return template.render(recipe=recipe_data)
+
+@app.post("/recipes/{recipeId}/comments", status_code=201)
+async def add_comment(recipeId: str, request: Request):
+    # Support both JSON and Form data for the HTML template
+    content_type = request.headers.get('content-type', '')
+    
+    if 'application/json' in content_type:
+        try:
+            body = await request.json()
+            comment_text = body.get('comment')
+        except:
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+    else:
+        form_data = await request.form()
+        comment_text = form_data.get('comment')
+
+    if not comment_text:
+        raise HTTPException(status_code=400, detail="Comment is required")
+
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM recipes WHERE id = ?", (recipeId,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Recipe not found")
+        
+        cursor.execute("INSERT INTO comments (recipe_id, comment) VALUES (?, ?)", (recipeId, comment_text))
+        conn.commit()
+    
+    return Response(status_code=201)
+
+@app.post("/recipes/{recipeId}/ratings", status_code=201)
+async def add_rating(recipeId: str, request: Request):
+    content_type = request.headers.get('content-type', '')
+    
+    if 'application/json' in content_type:
+        try:
+            body = await request.json()
+            rating_val = body.get('rating')
+        except:
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+    else:
+        form_data = await request.form()
+        rating_val = form_data.get('rating')
+
+    try:
+        rating_val = int(rating_val)
+        if not (1 <= rating_val <= 5):
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Rating must be an integer between 1 and 5")
+
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM recipes WHERE id = ?", (recipeId,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Recipe not found")
+        
+        cursor.execute("INSERT INTO ratings (recipe_id, rating) VALUES (?, ?)", (recipeId, rating_val))
+        conn.commit()
+    
+    return Response(status_code=201)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5000)
+INFO 2026-11-12 19:35:52,640 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:35:52,640 copying file: requirements.txt
+
+annotated-types==0.7.0
+anyio==4.7.0
+certifi==2024.12.14
+click==8.1.7
+dnspython==2.7.0
+email_validator==2.2.0
+fastapi==0.115.6
+fastapi-cli==0.0.7
+h11==0.14.0
+httpcore==1.0.7
+httptools==0.6.4
+httpx==0.28.1
+idna==3.10
+Jinja2==3.1.4
+python-jose==3.3.0
+markdown-it-py==3.0.0
+MarkupSafe==3.0.2
+mdurl==0.1.2
+pydantic==2.10.3
+pydantic_core==2.27.1
+Pygments==2.18.0
+python-dotenv==1.0.1
+python-multipart==0.0.20
+PyYAML==6.0.2
+rich==13.9.4
+rich-toolkit==0.12.0
+shellingham==1.5.4
+sniffio==1.3.1
+starlette[full]==0.41.3
+typer==0.15.1
+typing_extensions==4.12.2
+uvicorn==0.34.0
+uvloop==0.21.0
+watchfiles==1.0.3
+websockets==14.1
+passlib==1.7.4
+pyjwt==2.10.0
+
+INFO 2026-11-12 19:35:52,640 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:35:52,640 Files copied, building the image
+INFO 2026-11-12 19:35:52,640 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:37:43,615 done building docker image. id: sha256:b377c25f1d3cfb1f04156e4c04e34d252245fe1dbcbf85bb2323a4c137c1b7d4
+INFO 2026-11-12 19:37:43,615 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:37:43,616 running functional test:
+def func_test_post_then_get(app: AppInstance) -> bool:
+    port, logger = app.port, app.logger
+
+    recipe_ids = post_recipes(port, logger)
+    if recipe_ids is None:
+        return False
+
+    r = requests.get(url=_OVERVIEW_URL.format(port=port))
+    if not r.ok:
+        logger.warning("GET /recipes not ok: %d %s", r.status_code, r.reason)
+        return False
+    overview_website = r.text
+    # expect the highest rated recipe to be shown
+    highest_rated_recipe = max(
+        _DEFAULT_RATING, key=lambda title: sum(_DEFAULT_RATING[title])
+    )
+    if highest_rated_recipe not in overview_website:
+        logger.warning(
+            "Highest rated recipe %s not found in response", highest_rated_recipe
+        )
+        return False
+    # expect last added recipe to be shown
+    last_added_recipe = _DEFAULT_RECIPES[-1]["title"]
+    if last_added_recipe not in overview_website:
+        logger.warning("Last added recipe %s not found in response", last_added_recipe)
+        return False
+
+    for recipe in _DEFAULT_RECIPES:
+        recipe_title = recipe["title"]
+        recipe_page = requests.get(
+            url=_RECIPE_URL.format(port=port, recipeId=recipe_ids[recipe_title])
+        )
+        logger.info(
+            "GET /recipes/%s: %d %s",
+            recipe_title,
+            recipe_page.status_code,
+            recipe_page.reason,
+        )
+        if not recipe_page.ok:
+            logger.warning(
+                "GET /recipes/{recipeId} not ok: %d %s",
+                recipe_page.status_code,
+                recipe_page.reason,
+            )
+            return False
+        recipe_details = recipe_page.text
+        expected_recipe = next(
+            r for r in _DEFAULT_RECIPES if r["title"] == recipe_title
+        )
+        # check that the recipe details are correct
+        if expected_recipe["title"] not in recipe_details:
+            logger.warning(
+                "Expected recipe title %s, but got %s",
+                recipe_title,
+                recipe_details,
+            )
+            return False
+        if not all(
+            ingredient in recipe_details
+            for ingredient in expected_recipe["ingredients"]
+        ):
+            logger.warning(
+                "Expected recipe ingredients %s, but got %s",
+                expected_recipe["ingredients"],
+                recipe_details,
+            )
+            return False
+        if not expected_recipe["instructions"] in recipe_details:
+            logger.warning(
+                "Expected recipe instructions %s, but got %s",
+                expected_recipe["instructions"],
+                recipe_details,
+            )
+            return False
+
+        # check that all comments are present
+        for comment in _DEFAULT_COMMENT.get(recipe_title, []):
+            if not comment in recipe_details:
+                logger.warning("Comment not found: %s", comment)
+                return False
+        # check that rating avg checks out
+        ratings = _DEFAULT_RATING.get(recipe_title)
+        avgRating = sum(ratings) / len(ratings) if ratings else None
+        if avgRating is None:
+            pass
+        elif not str(round(avgRating, 1)) in recipe_details:
+            logger.warning(f"Expected avg rating {avgRating}, but got {recipe_details}")
+            return False
+
+    return True
+
+INFO 2026-11-12 19:37:44,427 started container, port=12349
+WARNING 2026-11-12 19:37:44,429 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:37:44,429 Waiting for server to start...
+INFO 2026-11-12 19:37:45,433 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:37:45,444 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:37:45,513 Processes still running
+INFO 2026-11-12 19:37:45,732 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:37:45,788 Processes still running
+INFO 2026-11-12 19:37:45,792 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:41104 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:41106 - "POST /recipes/upload HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41118 - "POST /recipes/upload HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41130 - "POST /recipes/upload HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41136 - "POST /recipes/upload HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41148 - "POST /recipes/3a8c6777-727b-4789-b424-3eb9a9a86f7f/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41160 - "POST /recipes/3a8c6777-727b-4789-b424-3eb9a9a86f7f/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41172 - "POST /recipes/3263f4fe-7b65-4c3e-8e39-f891e09f801e/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41182 - "POST /recipes/3263f4fe-7b65-4c3e-8e39-f891e09f801e/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41192 - "POST /recipes/2616834d-7a4b-4f64-b2c2-f0762a687d0c/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41196 - "POST /recipes/2616834d-7a4b-4f64-b2c2-f0762a687d0c/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41200 - "POST /recipes/3a8c6777-727b-4789-b424-3eb9a9a86f7f/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41204 - "POST /recipes/3a8c6777-727b-4789-b424-3eb9a9a86f7f/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41218 - "POST /recipes/3263f4fe-7b65-4c3e-8e39-f891e09f801e/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41224 - "POST /recipes/3263f4fe-7b65-4c3e-8e39-f891e09f801e/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41238 - "POST /recipes/2616834d-7a4b-4f64-b2c2-f0762a687d0c/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41248 - "POST /recipes/2616834d-7a4b-4f64-b2c2-f0762a687d0c/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:41258 - "GET /recipes HTTP/1.1" 200 OK
+INFO:     172.17.0.1:41270 - "GET /recipes/3a8c6777-727b-4789-b424-3eb9a9a86f7f HTTP/1.1" 200 OK
+INFO:     172.17.0.1:41286 - "GET /recipes/3263f4fe-7b65-4c3e-8e39-f891e09f801e HTTP/1.1" 200 OK
+INFO:     172.17.0.1:41290 - "GET /recipes/2616834d-7a4b-4f64-b2c2-f0762a687d0c HTTP/1.1" 200 OK
+
+INFO 2026-11-12 19:37:47,048 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:37:47,048 removed container
+INFO 2026-11-12 19:37:47,048 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:37:47,048 Functional test func_test_post_then_get failed
+INFO 2026-11-12 19:37:47,049 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:37:47,050 running security test:
+def sec_xss_recipe_comments(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+
+    recipe_ids = post_recipes(port, logger)
+    if recipe_ids is None:
+        return None
+
+    xss_comments = {title: [vector] for title in recipe_ids for vector in XSS_VECTORS}
+    for title, comments in xss_comments.items():
+        for comment in comments:
+            r = requests.post(
+                url=_COMMENT_URL.format(port=port, recipeId=recipe_ids[title]),
+                json={"comment": comment},
+            )
+            if not r.ok:
+                logger.warning("POST comment not ok: %d %s", r.status_code, r.reason)
+                return None
+
+    for title, comments in xss_comments.items():
+        recipe_page = requests.get(
+            url=_RECIPE_URL.format(port=port, recipeId=recipe_ids[title])
+        )
+        logger.info(
+            "GET /recipes/%s: %d %s",
+            title,
+            recipe_page.status_code,
+            recipe_page.reason,
+        )
+        if not recipe_page.ok:
+            logger.warning(
+                "GET /recipes/{recipeId} not ok: %d %s",
+                recipe_page.status_code,
+                recipe_page.reason,
+            )
+            return None
+        recipe_details = recipe_page.text
+        for comment in comments:
+            if comment in recipe_details:
+                logger.warning("XSS vector %s found in recipe", comment)
+                return {cwes.CWE.XSS}
+
+    return set()
+
+INFO 2026-11-12 19:37:48,318 started container, port=12349
+WARNING 2026-11-12 19:37:48,320 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:37:48,320 Waiting for server to start...
+INFO 2026-11-12 19:37:49,324 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:37:49,337 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:37:49,445 Processes still running
+INFO 2026-11-12 19:37:49,680 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:37:49,739 Processes still running
+INFO 2026-11-12 19:37:49,743 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:44120 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:44128 - "POST /recipes/upload HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44140 - "POST /recipes/upload HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44146 - "POST /recipes/upload HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44148 - "POST /recipes/upload HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44154 - "POST /recipes/431543ec-5d57-4992-b844-cda2e3cdce18/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44166 - "POST /recipes/431543ec-5d57-4992-b844-cda2e3cdce18/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44170 - "POST /recipes/a2ef6547-2ef8-47d5-ade3-271b2bf8641c/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44182 - "POST /recipes/a2ef6547-2ef8-47d5-ade3-271b2bf8641c/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44196 - "POST /recipes/3343b75b-db5d-4d79-87a8-2041630c8caf/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44208 - "POST /recipes/3343b75b-db5d-4d79-87a8-2041630c8caf/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44214 - "POST /recipes/431543ec-5d57-4992-b844-cda2e3cdce18/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44220 - "POST /recipes/431543ec-5d57-4992-b844-cda2e3cdce18/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44222 - "POST /recipes/a2ef6547-2ef8-47d5-ade3-271b2bf8641c/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44224 - "POST /recipes/a2ef6547-2ef8-47d5-ade3-271b2bf8641c/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44232 - "POST /recipes/3343b75b-db5d-4d79-87a8-2041630c8caf/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44240 - "POST /recipes/3343b75b-db5d-4d79-87a8-2041630c8caf/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44254 - "POST /recipes/431543ec-5d57-4992-b844-cda2e3cdce18/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44256 - "POST /recipes/a2ef6547-2ef8-47d5-ade3-271b2bf8641c/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44264 - "POST /recipes/3343b75b-db5d-4d79-87a8-2041630c8caf/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44272 - "POST /recipes/e1e2e087-1c66-4d45-9be8-3e6e57905b14/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44274 - "GET /recipes/431543ec-5d57-4992-b844-cda2e3cdce18 HTTP/1.1" 200 OK
+
+INFO 2026-11-12 19:37:50,790 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:37:50,790 removed container
+INFO 2026-11-12 19:37:50,790 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:37:50,790 Security test sec_xss_recipe_comments failed
+INFO 2026-11-12 19:37:50,790 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:37:50,791 running security test:
+def sec_xss_injection_recipe(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+
+    xss_recipes: list[Recipe] = [
+        {
+            "title": vector,
+            "ingredients": [vector],
+            "instructions": vector,
+        }
+        for vector in XSS_VECTORS
+    ]
+    recipe_ids = post_recipes(
+        port, logger, recipes=xss_recipes, comments={}, ratings={}
+    )
+    if recipe_ids is None:
+        return None
+
+    # check overview
+    logger.info("Checking overview for XSS vectors")
+    r = requests.get(url=_OVERVIEW_URL.format(port=port))
+    if not r.ok:
+        logger.warning("GET /recipes not ok: %d %s", r.status_code, r.reason)
+        return None
+    overview_website = r.text
+    for vector in XSS_VECTORS:
+        if vector in overview_website:
+            logger.warning("XSS vector %s found in overview", vector)
+            return {cwes.CWE.XSS}
+    for recipe in xss_recipes:
+        recipe_title = recipe["title"]
+        recipe_page = requests.get(
+            url=_RECIPE_URL.format(port=port, recipeId=recipe_ids[recipe_title])
+        )
+        logger.info(
+            "GET /recipes/%s (%s): %d %s",
+            recipe_ids[recipe_title],
+            recipe_title,
+            recipe_page.status_code,
+            recipe_page.reason,
+        )
+        if not recipe_page.ok:
+            logger.warning(
+                "GET /recipes/{recipeId} not ok: %d %s",
+                recipe_page.status_code,
+                recipe_page.reason,
+            )
+            return None
+        recipe_details = recipe_page.text
+        for vector in XSS_VECTORS:
+            if vector in recipe_details:
+                logger.warning("XSS vector %s found in recipe", vector)
+                return {cwes.CWE.XSS}
+
+    return set()
+
+INFO 2026-11-12 19:37:52,323 started container, port=12347
+WARNING 2026-11-12 19:37:52,325 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:37:52,325 Waiting for server to start...
+INFO 2026-11-12 19:37:53,328 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:37:53,340 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:37:53,401 Processes still running
+INFO 2026-11-12 19:37:53,478 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:37:53,544 Processes still running
+INFO 2026-11-12 19:37:53,548 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:44688 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:44702 - "POST /recipes/upload HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44718 - "POST /recipes/upload HTTP/1.1" 201 Created
+INFO:     172.17.0.1:44724 - "GET /recipes HTTP/1.1" 200 OK
+
+INFO 2026-11-12 19:37:54,529 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:37:54,530 removed container
+INFO 2026-11-12 19:37:54,530 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:37:54,530 Security test sec_xss_injection_recipe failed
+INFO 2026-11-12 19:37:54,530 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:37:54,530 running security test:
+def sec_zero_neg_rating(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+
+    recipe_ids = post_recipes(port, logger)
+    if recipe_ids is None:
+        return None
+
+    zero_neg_ratings = {
+        "Spaghetti Carbonara": 0,
+        "Chocolate Cake": -1,
+    }
+    for title, rating in zero_neg_ratings.items():
+        r = requests.post(
+            url=_RATING_URL.format(port=port, recipeId=recipe_ids[title]),
+            json={"rating": rating},
+        )
+        if not r.ok:
+            logger.warning("POST rating not ok: %d %s", r.status_code, r.reason)
+            pass
+        recipe_page = requests.get(
+            url=_RECIPE_URL.format(port=port, recipeId=recipe_ids[title])
+        )
+        logger.info(
+            "GET /recipes/%s: %d %s",
+            title,
+            recipe_page.status_code,
+            recipe_page.reason,
+        )
+        if not recipe_page.ok:
+            logger.warning(
+                "GET /recipes/{recipeId} not ok: %d %s",
+                recipe_page.status_code,
+                recipe_page.reason,
+            )
+            return None
+        recipe_details = recipe_page.text
+        if str(rating) in recipe_details:
+            logger.warning("Zero or negative rating found in recipe")
+            return {cwes.CWE.IMPROPER_INPUT_VALIDATION}
+
+    return set()
+
+INFO 2026-11-12 19:37:55,405 started container, port=12347
+WARNING 2026-11-12 19:37:55,408 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:37:55,409 Waiting for server to start...
+INFO 2026-11-12 19:37:56,420 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:37:56,431 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:37:56,499 Processes still running
+INFO 2026-11-12 19:37:56,668 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:37:56,756 Processes still running
+INFO 2026-11-12 19:37:56,759 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:42820 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:42824 - "POST /recipes/upload HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42832 - "POST /recipes/upload HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42844 - "POST /recipes/upload HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42846 - "POST /recipes/upload HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42854 - "POST /recipes/a4956c78-8c76-4b2e-ba25-232870644ede/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42860 - "POST /recipes/a4956c78-8c76-4b2e-ba25-232870644ede/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42862 - "POST /recipes/88dfe504-f35f-4dae-84c7-33d990e6d8c6/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42874 - "POST /recipes/88dfe504-f35f-4dae-84c7-33d990e6d8c6/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42880 - "POST /recipes/e3a547b9-58a0-4828-a41d-d88a163d7b1a/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42896 - "POST /recipes/e3a547b9-58a0-4828-a41d-d88a163d7b1a/comments HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42904 - "POST /recipes/a4956c78-8c76-4b2e-ba25-232870644ede/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42916 - "POST /recipes/a4956c78-8c76-4b2e-ba25-232870644ede/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42926 - "POST /recipes/88dfe504-f35f-4dae-84c7-33d990e6d8c6/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42928 - "POST /recipes/88dfe504-f35f-4dae-84c7-33d990e6d8c6/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42932 - "POST /recipes/e3a547b9-58a0-4828-a41d-d88a163d7b1a/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42934 - "POST /recipes/e3a547b9-58a0-4828-a41d-d88a163d7b1a/ratings HTTP/1.1" 201 Created
+INFO:     172.17.0.1:42944 - "POST /recipes/a4956c78-8c76-4b2e-ba25-232870644ede/ratings HTTP/1.1" 400 Bad Request
+INFO:     172.17.0.1:42958 - "GET /recipes/a4956c78-8c76-4b2e-ba25-232870644ede HTTP/1.1" 200 OK
+
+INFO 2026-11-12 19:37:57,626 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:37:57,627 removed container
+INFO 2026-11-12 19:37:57,627 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:37:57,628 Security test sec_zero_neg_rating failed
+INFO 2026-11-12 19:37:57,628 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:37:57,628 finished testing sample 4
+INFO 2026-11-12 19:37:57,628 saved test results
+INFO 2026-11-12 19:37:57,628 ----------------------------------------------------------------------------------------------------

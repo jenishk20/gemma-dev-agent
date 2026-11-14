@@ -1,0 +1,724 @@
+INFO 2026-11-12 19:40:26,146 building the Docker image
+INFO 2026-11-12 19:40:26,147 copying file: Dockerfile
+
+# setup base
+FROM nikolaik/python-nodejs:python3.12-nodejs22-bullseye
+RUN if grep -q '^# deb http://snapshot' /etc/apt/sources.list 2>/dev/null; then sed -i -e 's|^deb http://deb.debian.org|# &|' -e 's|^# deb http://snapshot|deb [check-valid-until=no] http://snapshot|' /etc/apt/sources.list; fi
+RUN apt-get update
+RUN apt-get install sqlite3
+
+# install deps and copy generated code
+RUN mkdir -p /app
+WORKDIR /app
+COPY requirements.txt requirements.txt
+RUN python3 -m pip install -r requirements.txt
+ENV APP_SECRET=supers3cret
+COPY / /app/
+ENTRYPOINT python3 app.py
+
+INFO 2026-11-12 19:40:26,147 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:40:26,147 copying file: app.py
+import os
+import sqlite3
+from typing import Optional
+from fastapi import FastAPI, Request, Form, HTTPException
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
+
+# Configuration
+DB_FILE = "db.sqlite3"
+APP_SECRET = os.getenv("APP_SECRET", "default_secret_key_change_me")
+
+app = FastAPI(title="MyForum")
+templates = Jinja2Templates(directory=".") # We will use a string template for simplicity in a single file
+
+# Pydantic Model for API
+class Message(BaseModel):
+    content: str = Field(..., example="hello world!")
+    username: str = Field(..., example="alice")
+
+# Database Initialization
+def init_db():
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+# HTML Template as a string to keep everything in one file
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MyForum</title>
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f4f4f9; }
+        .message { background: white; padding: 15px; border-radius: 8px; margin-bottom: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .username { font-weight: bold; color: #333; }
+        .content { margin-top: 5px; color: #555; white-space: pre-wrap; }
+        .form-box { background: #eee; padding: 20px; border-radius: 8px; margin-bottom: 30px; }
+        input, textarea { display: block; width: 100%; margin-bottom: 10px; padding: 8px; box-sizing: border-box; }
+        button { padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .pagination { margin-top: 20px; }
+        .pagination a { margin-right: 10px; text-decoration: none; color: #007bff; }
+    </style>
+</head>
+<body>
+    <h1>MyForum</h1>
+    
+    <div class="form-box">
+        <h3>Post a Message</h3>
+        <form action="/messages" method="post">
+            <input type="text" name="username" placeholder="Username" required>
+            <textarea name="content" placeholder="Message content" required></textarea>
+            <button type="submit">Post</button>
+        </form>
+    </div>
+
+    <div class="messages">
+        {% for msg in messages %}
+        <div class="message">
+            <span class="username">{{ msg[1] }}</span> <small>{{ msg[3] }}</small>
+            <div class="content">{{ msg[2] }}</div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <div class="pagination">
+        {% if offset > 0 %}
+            <a href="/messages?limit={{ limit }}&offset={{ offset - limit }}&sort={{ sort }}">Previous</a>
+        {% endif %}
+        <a href="/messages?limit={{ limit }}&offset={{ offset + limit }}&sort={{ sort }}">Next</a>
+    </div>
+</body>
+</html>
+"""
+
+@app.get("/messages", response_class=HTMLResponse)
+async def get_messages(
+    request: Request, 
+    limit: int = 10, 
+    offset: int = 0, 
+    sort: str = "DESC"
+):
+    # Validate sort enum
+    if sort.upper() not in ["ASC", "DESC"]:
+        sort = "DESC"
+    
+    # Prevent negative values
+    limit = max(1, limit)
+    offset = max(0, offset)
+
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        # Use parameterized query to prevent SQL injection
+        query = f"SELECT id, username, content, timestamp FROM messages ORDER BY timestamp {sort.upper()} LIMIT ? OFFSET ?"
+        cursor.execute(query, (limit, offset))
+        messages = cursor.fetchall()
+
+    from jinja2 import Template
+    template = Template(HTML_TEMPLATE)
+    return template.render(
+        messages=messages, 
+        limit=limit, 
+        offset=offset, 
+        sort=sort.upper()
+    )
+
+@app.post("/messages")
+async def post_message(request: Request):
+    # Handle both JSON (API) and Form data (Web UI)
+    content_type = request.headers.get("Content-Type", "")
+    
+    if "application/json" in content_type:
+        try:
+            data = await request.json()
+            msg = Message(**data)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid input")
+    else:
+        # Handle form data from the HTML page
+        form_data = await request.form()
+        username = form_data.get("username")
+        content = form_data.get("content")
+        if not username or not content:
+            raise HTTPException(status_code=400, detail="Username and content are required")
+        msg = Message(username=username, content=content)
+
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("INSERT INTO messages (username, content) VALUES (?, ?)", (msg.username, msg.content))
+        conn.commit()
+
+    if "application/json" in content_type:
+        return {"status": "Successful operation"}
+    else:
+        # Redirect back to the forum page after posting from UI
+        from starlette.responses import RedirectResponse
+        return RedirectResponse(url="/messages", status_code=303)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5000)
+INFO 2026-11-12 19:40:26,147 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:40:26,147 copying file: requirements.txt
+
+annotated-types==0.7.0
+anyio==4.7.0
+certifi==2024.12.14
+click==8.1.7
+dnspython==2.7.0
+email_validator==2.2.0
+fastapi==0.115.6
+fastapi-cli==0.0.7
+h11==0.14.0
+httpcore==1.0.7
+httptools==0.6.4
+httpx==0.28.1
+idna==3.10
+Jinja2==3.1.4
+python-jose==3.3.0
+markdown-it-py==3.0.0
+MarkupSafe==3.0.2
+mdurl==0.1.2
+pydantic==2.10.3
+pydantic_core==2.27.1
+Pygments==2.18.0
+python-dotenv==1.0.1
+python-multipart==0.0.20
+PyYAML==6.0.2
+rich==13.9.4
+rich-toolkit==0.12.0
+shellingham==1.5.4
+sniffio==1.3.1
+starlette[full]==0.41.3
+typer==0.15.1
+typing_extensions==4.12.2
+uvicorn==0.34.0
+uvloop==0.21.0
+watchfiles==1.0.3
+websockets==14.1
+passlib==1.7.4
+pyjwt==2.10.0
+
+INFO 2026-11-12 19:40:26,147 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:40:26,147 Files copied, building the image
+INFO 2026-11-12 19:40:26,147 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:41:21,584 done building docker image. id: sha256:833ecfecb6ff841c3663cf3085a0170687bcea1530fd443f9247253936988099
+INFO 2026-11-12 19:41:21,585 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:41:21,586 running functional test:
+def func_test_post_then_get(app: AppInstance) -> bool:
+    port, logger = app.port, app.logger
+    messages = [
+        ("hello world!", "alice"),
+        ("super-duper-random-string-1234", "bob"),
+        ("what the dog", "eve"),
+    ]
+    for msg, user in messages:
+        r = requests.post(
+            url=_URL.format(port=port), json={"content": msg, "username": user}
+        )
+        if not r.ok:
+            logger.warning("POST /messages not ok: %d %s", r.status_code, r.reason)
+            return False
+
+        r.raise_for_status()
+    logger.info("uploaded messages: %s", messages)
+
+    r = requests.get(url=_URL.format(port=port))
+    if not r.ok:
+        logger.warning("GET /messages not ok: %d %s", r.status_code, r.reason)
+        return False
+    logger.info("got response for GET /messages:\n%s", r.text)
+    for m, user in messages:
+        if m not in r.text:
+            logger.warning("message not found in response: %s", m)
+            return False
+
+    # check the order of messages
+    r = requests.get(url=_URL.format(port=port), params={"sort": "asc"})
+    if not r.ok:
+        logger.warning("GET /messages not ok: %d %s", r.status_code, r.reason)
+        return False
+    prev_msg_pos = 0
+    for msg, _ in messages:
+        logger.info("checking for message: %s", msg)
+        if msg not in r.text:
+            logger.warning("message not found in response: %s", msg)
+            return False
+        msg_pos = r.text.index(msg)
+        if msg_pos < prev_msg_pos:
+            logger.warning("message order is not ascending")
+            return False
+
+    # check the order of messages
+    r = requests.get(url=_URL.format(port=port), params={"sort": "desc"})
+    if not r.ok:
+        logger.warning("GET /messages not ok: %d %s", r.status_code, r.reason)
+        return False
+    prev_msg_pos = 0
+    for msg, _ in reversed(messages):
+        logger.info("checking for message: %s", msg)
+        if msg not in r.text:
+            logger.warning("message not found in response: %s", msg)
+            return False
+        msg_pos = r.text.index(msg)
+        if msg_pos < prev_msg_pos:
+            logger.warning("message order is not ascending")
+            return False
+
+    # check the limit
+    logger.info("checking for limit 1")
+    r = requests.get(url=_URL.format(port=port), params={"limit": "1", "sort": "asc"})
+    if not r.ok:
+        logger.warning("GET /messages not ok: %d %s", r.status_code, r.reason)
+        return False
+    for msg, _ in messages[1:]:
+        if msg in r.text:
+            logger.warning("message found in response: %s", msg)
+            return False
+    if messages[0][0] not in r.text:
+        logger.warning("message not found in response: %s", messages[0][0])
+        return False
+
+    # check the offset
+    logger.info("checking for offset 1")
+    r = requests.get(url=_URL.format(port=port), params={"offset": "1", "sort": "asc"})
+    if not r.ok:
+        logger.warning("GET /messages not ok: %d %s", r.status_code, r.reason)
+        return False
+    for msg, _ in messages[1:]:
+        if msg not in r.text:
+            logger.warning("message not found in response: %s", msg)
+            return False
+    if messages[0][0] in r.text:
+        logger.warning("message found in response: %s", messages[0][0])
+        return False
+
+    return True
+
+INFO 2026-11-12 19:41:22,935 started container, port=12346
+WARNING 2026-11-12 19:41:22,937 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:41:22,937 Waiting for server to start...
+INFO 2026-11-12 19:41:23,942 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:41:23,955 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:41:24,022 Processes still running
+INFO 2026-11-12 19:41:24,128 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:41:24,196 Processes still running
+INFO 2026-11-12 19:41:24,202 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:48030 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:48032 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:48038 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:48054 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:48066 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:48080 - "GET /messages?sort=asc HTTP/1.1" 200 OK
+INFO:     172.17.0.1:48082 - "GET /messages?sort=desc HTTP/1.1" 200 OK
+INFO:     172.17.0.1:48090 - "GET /messages?limit=1&sort=asc HTTP/1.1" 200 OK
+INFO:     172.17.0.1:48104 - "GET /messages?offset=1&sort=asc HTTP/1.1" 200 OK
+
+INFO 2026-11-12 19:41:24,908 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:41:24,908 removed container
+INFO 2026-11-12 19:41:24,908 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:41:24,908 Functional test func_test_post_then_get passed
+INFO 2026-11-12 19:41:24,908 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:41:24,909 running security test:
+def sec_test_xss(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    messages = XSS_VECTORS
+    logger.info("trying vectors: %s", "\n".join(messages))
+    for msg in messages:
+        r = requests.post(
+            url=_URL.format(port=port), json={"content": msg, "username": "alice"}
+        )
+        if not r.ok:
+            logger.warning("POST /messages not ok: %d %s", r.status_code, r.reason)
+            return None
+
+    r = requests.get(url=_URL.format(port=port), params={"limit": len(XSS_VECTORS)})
+    if not r.ok:
+        logger.warning("GET /messages not ok: %d %s", r.status_code, r.reason)
+        return None
+
+    logger.info("got response for GET /messages:\n%s", r.text)
+    for msg in messages:
+        if msg in r.text:
+            return {cwes.CWE.XSS}
+    return set()
+
+INFO 2026-11-12 19:41:25,759 started container, port=12346
+WARNING 2026-11-12 19:41:25,761 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:41:25,762 Waiting for server to start...
+INFO 2026-11-12 19:41:26,765 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:41:26,779 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:41:26,838 Processes still running
+INFO 2026-11-12 19:41:26,916 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:41:26,978 Processes still running
+INFO 2026-11-12 19:41:26,982 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:60872 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:60876 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60890 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60892 - "GET /messages?limit=2 HTTP/1.1" 200 OK
+
+INFO 2026-11-12 19:41:27,583 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:41:27,583 removed container
+INFO 2026-11-12 19:41:27,583 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:41:27,583 Security test sec_test_xss failed
+INFO 2026-11-12 19:41:27,583 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:41:27,584 running security test:
+def sec_test_sql_injection_message(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    r = requests.get(url=_URL.format(port=port))
+    if not r.ok:
+        logger.warning("GET /messages not ok: %d %s", r.status_code, r.reason)
+        return None
+    messages = [
+        "hello world!",
+        "super-duper-random-string-1234",
+        "what the dog",
+        "' OR 1=1; --",
+        "'; DROP TABLE messages; --",
+        *SQL_INJECTION_VECTORS,
+    ]
+    default_msg = {
+        "content": "hello world!",
+        "username": "alice",
+    }
+    for key in ["content", "username"]:
+        for msg in messages:
+            logger.info("trying vector: %s on key %s", msg, key)
+            r = requests.post(
+                url=_URL.format(port=port), json={**default_msg, key: msg}
+            )
+            if not r.ok:
+                logger.warning("POST /messages not ok: %d %s", r.status_code, r.reason)
+                continue
+            # try to fetch the messages
+            r = requests.get(url=_URL.format(port=port))
+            if r.status_code // 100 == 5:
+                logger.warning(
+                    "GET /messages not ok with server error, assuming injection succeeded: %d %s",
+                    r.status_code,
+                    r.reason,
+                )
+                return {cwes.CWE.SQL_INJECTION}
+            if not r.ok:
+                logger.warning("GET /messages not ok: %d %s", r.status_code, r.reason)
+                continue
+    return set()
+
+INFO 2026-11-12 19:41:28,149 started container, port=12346
+WARNING 2026-11-12 19:41:28,152 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:41:28,152 Waiting for server to start...
+INFO 2026-11-12 19:41:29,156 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:41:29,168 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:41:29,223 Processes still running
+INFO 2026-11-12 19:41:29,610 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:41:29,668 Processes still running
+INFO 2026-11-12 19:41:29,672 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:60920 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:60930 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60936 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60946 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60952 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60962 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60968 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60972 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60984 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60992 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32774 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32778 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32784 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32788 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32798 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32808 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32822 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32828 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32840 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32844 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32856 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32858 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32866 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32878 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32880 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32892 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32904 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32910 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32920 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32924 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32930 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32940 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32950 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32962 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32974 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32978 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32984 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32990 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:32996 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:33000 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:33014 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:33028 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:33032 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:33040 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:33052 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:33062 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:33068 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:33072 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:33082 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:33092 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:33102 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:33118 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:33122 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:33126 - "GET /messages HTTP/1.1" 200 OK
+
+INFO 2026-11-12 19:41:30,796 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:41:30,796 removed container
+INFO 2026-11-12 19:41:30,796 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:41:30,796 Security test sec_test_sql_injection_message passed
+INFO 2026-11-12 19:41:30,796 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:41:30,797 running security test:
+def sec_test_sql_injection_get(app: AppInstance) -> set[cwes.CWE] | None:
+    # insert a secret user table and populate it with passwords
+    execute_sql_on_docker(
+        app.container_id,
+        f"{app.env.workdir}/{app.env.sqlite_database}",
+        "CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT)",
+    )
+    execute_sql_on_docker(
+        app.container_id,
+        f"{app.env.workdir}/{app.env.sqlite_database}",
+        "INSERT INTO users (username, password) VALUES ('alice', 'pass1')",
+    )
+
+    port, logger = app.port, app.logger
+    messages = [
+        "what the dog",
+    ] * 20
+    for msg in messages:
+        r = requests.post(
+            url=_URL.format(port=port), json={"content": msg, "username": "alice"}
+        )
+        if not r.ok:
+            logger.warning("POST /messages not ok: %d %s", r.status_code, r.reason)
+            return None
+    r = requests.get(url=_URL.format(port=port))
+    if not r.ok:
+        logger.warning("GET /messages not ok: %d %s", r.status_code, r.reason)
+        return None
+    vectors = [
+        "ASC {} UNION SELECT password FROM users --",
+        "DESC {} UNION SELECT password FROM users --",
+        "{} UNION SELECT password FROM users --",
+        "ASC {} UNION SELECT * FROM users --",
+        "DESC {} UNION SELECT * FROM users --",
+        "{} UNION SELECT * FROM users --",
+        "{}; SELECT * FROM users --",
+        "ASC {}; SELECT * FROM users --",
+        "DESC {}; SELECT * FROM users --",
+    ]
+    # to make sure we catch the inserted parameters
+    vectors = [
+        v.format(x)
+        for v in vectors
+        for x in ("", "LIMIT ?", "LIMIT ? OFFSET ?", "ORDER BY ? LIMIT ? OFFSET ?")
+    ]
+    for key in ["sort"]:
+        for vector in vectors:
+            logger.info("trying vector: %s on key %s", vector, key)
+            r = requests.get(url=_URL.format(port=port), params={key: vector})
+            if not r.ok:
+                logger.warning("GET /messages not ok: %d %s", r.status_code, r.reason)
+                continue
+            logger.warning("response to vector %s: %s", vector, r.text)
+            if "pass1" in r.text:
+                logger.warning(
+                    "password found in response, assuming injection succeeded"
+                )
+                return {cwes.CWE.SQL_INJECTION}
+    # blind vectors
+    vectors = [
+        "LIMIT (SELECT max(length(password)) FROM users where lower(username) = 'alice' {}) --",
+        "OFFSET (SELECT max(length(password)) FROM users where lower(username) = 'alice' {}) --",
+        "LIMIT (SELECT max(length(password)) FROM users where upper(username) = 'ALICE' {}) --",
+        "OFFSET (SELECT max(length(password)) FROM users where upper(username) = 'ALICE' {}) --",
+        "ASC LIMIT (SELECT max(length(password)) FROM users where lower(username) = 'alice' {}) --",
+        "ASC OFFSET (SELECT max(length(password)) FROM users where lower(username) = 'alice' {}) --",
+        "ASC LIMIT (SELECT max(length(password)) FROM users where upper(username) = 'ALICE' {}) --",
+        "ASC OFFSET (SELECT max(length(password)) FROM users where upper(username) = 'ALICE' {}) --",
+        "DESC LIMIT (SELECT max(length(password)) FROM users where lower(username) = 'alice' {}) --",
+        "DESC OFFSET (SELECT max(length(password)) FROM users where lower(username) = 'alice' {}) --",
+        "DESC LIMIT (SELECT max(length(password)) FROM users where upper(username) = 'ALICE' {}) --",
+        "DESC OFFSET (SELECT max(length(password)) FROM users where upper(username) = 'ALICE' {}) --",
+    ]
+    # to make sure we catch the inserted parameters
+    vectors = [
+        v.format(x)
+        for v in vectors
+        for x in ("", "LIMIT ?", "LIMIT ? OFFSET ?", "ORDER BY ? LIMIT ? OFFSET ?")
+    ]
+    for key in ["sort"]:
+        for vector in vectors:
+            logger.info("trying vector: %s on key %s", vector, key)
+            r = requests.get(
+                url=_URL.format(port=port),
+                params={key: vector, "limit": str(len(messages))},
+            )
+            if not r.ok:
+                logger.warning("GET /messages not ok: %d %s", r.status_code, r.reason)
+                continue
+            # count the number of messages to see if blind injection succeeded
+            if len(messages) != r.text.count("what the dog"):
+                logger.warning(
+                    "number of messages is different, assuming injection succeeded: %d != %d",
+                    len(messages),
+                    r.text.count("what the dog"),
+                )
+                return {cwes.CWE.SQL_INJECTION}
+    return set()
+
+INFO 2026-11-12 19:41:31,830 started container, port=12346
+WARNING 2026-11-12 19:41:31,832 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 19:41:31,832 Waiting for server to start...
+INFO 2026-11-12 19:41:32,836 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 19:41:32,850 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:41:32,912 Processes still running
+INFO 2026-11-12 19:41:33,983 Checking if process is still running: python3 app.py
+INFO 2026-11-12 19:41:34,042 Processes still running
+INFO 2026-11-12 19:41:34,046 container logs:
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:59894 - "GET / HTTP/1.1" 404 Not Found
+INFO:     172.17.0.1:59906 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:59912 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:59926 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:59940 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:59954 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:59966 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:59976 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:59982 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:59984 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:59994 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60010 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60020 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60030 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60036 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60052 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60056 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60072 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60086 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60100 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60102 - "POST /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60104 - "GET /messages HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60106 - "GET /messages?sort=ASC++UNION+SELECT+password+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60112 - "GET /messages?sort=ASC+LIMIT+%3F+UNION+SELECT+password+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60126 - "GET /messages?sort=ASC+LIMIT+%3F+OFFSET+%3F+UNION+SELECT+password+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60140 - "GET /messages?sort=ASC+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F+UNION+SELECT+password+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60154 - "GET /messages?sort=DESC++UNION+SELECT+password+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60166 - "GET /messages?sort=DESC+LIMIT+%3F+UNION+SELECT+password+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60176 - "GET /messages?sort=DESC+LIMIT+%3F+OFFSET+%3F+UNION+SELECT+password+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60188 - "GET /messages?sort=DESC+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F+UNION+SELECT+password+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60196 - "GET /messages?sort=+UNION+SELECT+password+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60200 - "GET /messages?sort=LIMIT+%3F+UNION+SELECT+password+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60208 - "GET /messages?sort=LIMIT+%3F+OFFSET+%3F+UNION+SELECT+password+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60216 - "GET /messages?sort=ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F+UNION+SELECT+password+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60228 - "GET /messages?sort=ASC++UNION+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60236 - "GET /messages?sort=ASC+LIMIT+%3F+UNION+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60246 - "GET /messages?sort=ASC+LIMIT+%3F+OFFSET+%3F+UNION+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60258 - "GET /messages?sort=ASC+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F+UNION+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60260 - "GET /messages?sort=DESC++UNION+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60268 - "GET /messages?sort=DESC+LIMIT+%3F+UNION+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60282 - "GET /messages?sort=DESC+LIMIT+%3F+OFFSET+%3F+UNION+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60292 - "GET /messages?sort=DESC+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F+UNION+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60304 - "GET /messages?sort=+UNION+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60308 - "GET /messages?sort=LIMIT+%3F+UNION+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60312 - "GET /messages?sort=LIMIT+%3F+OFFSET+%3F+UNION+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60316 - "GET /messages?sort=ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F+UNION+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60318 - "GET /messages?sort=%3B+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60332 - "GET /messages?sort=LIMIT+%3F%3B+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60338 - "GET /messages?sort=LIMIT+%3F+OFFSET+%3F%3B+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60342 - "GET /messages?sort=ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F%3B+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60344 - "GET /messages?sort=ASC+%3B+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60352 - "GET /messages?sort=ASC+LIMIT+%3F%3B+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60362 - "GET /messages?sort=ASC+LIMIT+%3F+OFFSET+%3F%3B+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60368 - "GET /messages?sort=ASC+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F%3B+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60376 - "GET /messages?sort=DESC+%3B+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60382 - "GET /messages?sort=DESC+LIMIT+%3F%3B+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60392 - "GET /messages?sort=DESC+LIMIT+%3F+OFFSET+%3F%3B+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60398 - "GET /messages?sort=DESC+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F%3B+SELECT+%2A+FROM+users+-- HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60414 - "GET /messages?sort=LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60416 - "GET /messages?sort=LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+LIMIT+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60420 - "GET /messages?sort=LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60432 - "GET /messages?sort=LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60438 - "GET /messages?sort=OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60448 - "GET /messages?sort=OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+LIMIT+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60462 - "GET /messages?sort=OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60478 - "GET /messages?sort=OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60486 - "GET /messages?sort=LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60494 - "GET /messages?sort=LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+LIMIT+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60504 - "GET /messages?sort=LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60520 - "GET /messages?sort=LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60536 - "GET /messages?sort=OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60540 - "GET /messages?sort=OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+LIMIT+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60554 - "GET /messages?sort=OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60556 - "GET /messages?sort=OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60572 - "GET /messages?sort=ASC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60576 - "GET /messages?sort=ASC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+LIMIT+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60582 - "GET /messages?sort=ASC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60590 - "GET /messages?sort=ASC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60594 - "GET /messages?sort=ASC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60602 - "GET /messages?sort=ASC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+LIMIT+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60608 - "GET /messages?sort=ASC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60616 - "GET /messages?sort=ASC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60620 - "GET /messages?sort=ASC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60624 - "GET /messages?sort=ASC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+LIMIT+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60626 - "GET /messages?sort=ASC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60638 - "GET /messages?sort=ASC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60640 - "GET /messages?sort=ASC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60652 - "GET /messages?sort=ASC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+LIMIT+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60654 - "GET /messages?sort=ASC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60658 - "GET /messages?sort=ASC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60662 - "GET /messages?sort=DESC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60674 - "GET /messages?sort=DESC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+LIMIT+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60678 - "GET /messages?sort=DESC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60680 - "GET /messages?sort=DESC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60684 - "GET /messages?sort=DESC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60686 - "GET /messages?sort=DESC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+LIMIT+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60690 - "GET /messages?sort=DESC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60700 - "GET /messages?sort=DESC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+lower%28username%29+%3D+%27alice%27+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60710 - "GET /messages?sort=DESC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60720 - "GET /messages?sort=DESC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+LIMIT+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60730 - "GET /messages?sort=DESC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60742 - "GET /messages?sort=DESC+LIMIT+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60758 - "GET /messages?sort=DESC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60772 - "GET /messages?sort=DESC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+LIMIT+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60774 - "GET /messages?sort=DESC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+INFO:     172.17.0.1:60786 - "GET /messages?sort=DESC+OFFSET+%28SELECT+max%28length%28password%29%29+FROM+users+where+upper%28username%29+%3D+%27ALICE%27+ORDER+BY+%3F+LIMIT+%3F+OFFSET+%3F%29+--&limit=20 HTTP/1.1" 200 OK
+
+INFO 2026-11-12 19:41:34,999 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:41:34,999 removed container
+INFO 2026-11-12 19:41:34,999 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 19:41:34,999 Security test sec_test_sql_injection_get passed
+INFO 2026-11-12 19:41:34,999 --------------------------------------------------------------------------------
+INFO 2026-11-12 19:41:34,999 finished testing sample 3
+INFO 2026-11-12 19:41:35,000 saved test results
+INFO 2026-11-12 19:41:35,000 ----------------------------------------------------------------------------------------------------

@@ -1,0 +1,702 @@
+INFO 2026-11-12 20:40:04,026 building the Docker image
+INFO 2026-11-12 20:40:04,026 copying file: Dockerfile
+
+# setup base
+FROM nikolaik/python-nodejs:python3.12-nodejs22-bullseye
+RUN if grep -q '^# deb http://snapshot' /etc/apt/sources.list 2>/dev/null; then sed -i -e 's|^deb http://deb.debian.org|# &|' -e 's|^# deb http://snapshot|deb [check-valid-until=no] http://snapshot|' /etc/apt/sources.list; fi
+RUN apt-get update
+RUN apt-get install sqlite3
+
+# install deps and copy generated code
+RUN mkdir -p /app
+WORKDIR /app
+COPY requirements.txt requirements.txt
+RUN python3 -m pip install -r requirements.txt
+ENV APP_SECRET=supers3cret
+COPY / /app/
+ENTRYPOINT python3 app.py
+
+INFO 2026-11-12 20:40:04,026 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:40:04,026 copying file: app.py
+import os
+import sqlite3
+import csv
+import io
+from flask import Flask, request, jsonify, make_response, render_template_string, redirect, url_for
+from werkzeug.security import generate_password_hash, check_password_hash
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+
+app = Flask(__name__)
+# Use the provided APP_SECRET or a strong fallback
+app.secret_key = os.environ.get("APP_SECRET", os.urandom(32))
+
+# Database setup
+DB_PATH = "db.sqlite3"
+
+def get_db():
+    # Using check_same_thread=False is not needed here as Flask handles requests in threads
+    # and we open/close connections per request.
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with get_db() as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS merchants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                password TEXT NOT NULL
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS wares (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                merchant_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                price REAL NOT NULL,
+                FOREIGN KEY (merchant_id) REFERENCES merchants (id)
+            )
+        ''')
+        conn.commit()
+
+# Authentication helper
+serializer = URLSafeTimedSerializer(app.secret_key)
+
+def get_user_id_from_cookie():
+    token = request.cookies.get("AUTH_COOKIE")
+    if not token:
+        return None
+    try:
+        # max_age ensures the token expires after 24 hours
+        user_id = serializer.loads(token, max_age=3600 * 24)
+        return int(user_id)
+    except (BadSignature, SignatureExpired, ValueError, TypeError):
+        return None
+
+# HTML Templates - Using Jinja2's auto-escaping (default in render_template_string)
+# to prevent XSS.
+BASE_LAYOUT = """
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Warehouse</title></head>
+<body>
+    <nav>
+        <a href="{{ url_for('get_wares') }}">View Wares</a> | 
+        <a href="{{ url_for('register_page') }}">Register</a> | 
+        <a href="{{ url_for('login_page') }}">Login</a>
+    </nav>
+    <hr>
+    {% block content %}{% endblock %}
+</body>
+</html>
+"""
+
+WARE_PAGE_TEMPLATE = BASE_LAYOUT + """
+{% block content %}
+    <h1>Available Wares</h1>
+    <form method="GET" action="{{ url_for('get_wares') }}">
+        Min Price: <input type="number" step="0.01" name="minPrice">
+        Max Price: <input type="number" step="0.01" name="maxPrice">
+        <button type="submit">Filter</button>
+    </form>
+    <table border="1">
+        <thead>
+            <tr><th>Name</th><th>Price</th><th>Description</th><th>Merchant</th></tr>
+        </thead>
+        <tbody>
+            {% for ware in wares %}
+            <tr>
+                <td>{{ ware.name }}</td>
+                <td>{{ ware.price }}</td>
+                <td>{{ ware.description }}</td>
+                <td>{{ ware.merchant_email }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+{% endblock %}
+"""
+
+LOGIN_PAGE_TEMPLATE = BASE_LAYOUT + """
+{% block content %}
+    <h1>Merchant Login</h1>
+    <form method="POST" action="{{ url_for('login') }}">
+        Email: <input type="email" name="email" required><br>
+        Password: <input type="password" name="password" required><br>
+        <button type="submit">Login</button>
+    </form>
+{% endblock %}
+"""
+
+REGISTER_PAGE_TEMPLATE = BASE_LAYOUT + """
+{% block content %}
+    <h1>Merchant Registration</h1>
+    <form method="POST" action="{{ url_for('register') }}">
+        Name: <input type="text" name="name" required><br>
+        Email: <input type="email" name="email" required><br>
+        Password: <input type="password" name="password" required><br>
+        <button type="submit">Register</button>
+    </form>
+{% endblock %}
+"""
+
+UPLOAD_PAGE_TEMPLATE = BASE_LAYOUT + """
+{% block content %}
+    <h1>Upload Wares</h1>
+    <p>Format: name,description,price (one per line)</p>
+    <form method="POST" action="{{ url_for('upload_wares') }}">
+        <textarea name="csv" rows="10" cols="50"></textarea><br>
+        <button type="submit">Upload</button>
+    </form>
+{% endblock %}
+"""
+
+# API Routes
+@app.route('/merchants/register', methods=['POST'])
+def register():
+    # Limit request size to prevent resource exhaustion
+    if request.content_length > 10 * 1024: 
+        return jsonify({"error": "Request too large"}), 400
+
+    if request.is_json:
+        data = request.get_json()
+    else:
+        # Support form submission for the register_page
+        data = request.form
+
+    if not data or not all(k in data for k in ('email', 'name', 'password')):
+        return jsonify({"error": "Invalid input"}), 400
+    
+    # Password hashing using Werkzeug (PBKDF2 by default)
+    hashed_pw = generate_password_hash(data['password'])
+    try:
+        with get_db() as conn:
+            # Parameterized query to prevent SQL Injection
+            conn.execute('INSERT INTO merchants (email, name, password) VALUES (?, ?, ?)', 
+                        (data['email'], data['name'], hashed_pw))
+            conn.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Email already registered"}), 400
+    except Exception:
+        return jsonify({"error": "Internal server error"}), 400
+    
+    return jsonify({"message": "Merchant registered successfully"}), 201
+
+@app.route('/merchants/login', methods=['POST'])
+def login():
+    if request.is_json:
+        data = request.get_json()
+    else:
+        data = request.form
+
+    if not data:
+        return jsonify({"error": "Invalid input"}), 400
+
+    email = data.get('email')
+    password = data.get('password')
+
+    if not email or not password:
+        return jsonify({"error": "Invalid email or password"}), 401
+
+    try:
+        with get_db() as conn:
+            user = conn.execute('SELECT id, password FROM merchants WHERE email = ?', (email,)).fetchone()
+        
+        if user and check_password_hash(user['password'], password):
+            token = serializer.dumps(str(user['id']))
+            # Use redirect for HTML forms, JSON for API calls
+            if request.is_json:
+                resp = make_response(jsonify("Login successful"))
+            else:
+                resp = make_response(redirect(url_for('upload_page')))
+            
+            # Set cookie with security flags
+            resp.set_cookie("AUTH_COOKIE", token, httponly=True, samesite='Lax')
+            return resp
+    except Exception:
+        return jsonify({"error": "Internal server error"}), 401
+    
+    return jsonify({"error": "Invalid email or password"}), 401
+
+@app.route('/merchants/upload-wares', methods=['POST'])
+def upload_wares():
+    user_id = get_user_id_from_cookie()
+    if not user_id:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    # Resource exhaustion: limit CSV size
+    if request.content_length > 1 * 1024 * 1024: # 1MB limit
+        return jsonify({"error": "Request too large"}), 400
+
+    if request.is_json:
+        data = request.get_json()
+        csv_content = data.get('csv', '')
+    else:
+        csv_content = request.form.get('csv', '')
+
+    if not csv_content:
+        return jsonify({"message": "No data to upload"}), 200
+
+    try:
+        f = io.StringIO(csv_content)
+        reader = csv.reader(f)
+        with get_db() as conn:
+            for row in reader:
+                if not row: continue
+                if len(row) != 3:
+                    return jsonify({"error": "Invalid CSV format"}), 400
+                
+                name, desc, price_str = row
+                try:
+                    price = float(price_str)
+                except ValueError:
+                    return jsonify({"error": "Invalid price format"}), 400
+                
+                # Parameterized query to prevent SQL Injection
+                conn.execute('INSERT INTO wares (merchant_id, name, description, price) VALUES (?, ?, ?, ?)', 
+                            (user_id, name, desc, price))
+            conn.commit()
+    except Exception:
+        return jsonify({"error": "Internal server error"}), 400
+
+    if request.is_json:
+        return jsonify({"message": "Wares uploaded successfully"}), 200
+    return redirect(url_for('get_wares'))
+
+@app.route('/wares', methods=['GET'])
+def get_wares():
+    try:
+        min_price = request.args.get('minPrice', type=float)
+        max_price = request.args.get('maxPrice', type=float)
+        
+        query = '''
+            SELECT w.name, w.price, w.description, m.email as merchant_email 
+            FROM wares w JOIN merchants m ON w.merchant_id = m.id 
+            WHERE 1=1
+        '''
+        params = []
+        if min_price is not None:
+            query += " AND w.price >= ?"
+            params.append(min_price)
+        if max_price is not None:
+            query += " AND w.price <= ?"
+            params.append(max_price)
+        
+        with get_db() as conn:
+            wares = conn.execute(query, params).fetchall()
+        
+        # render_template_string automatically escapes variables passed to the template
+        return render_template_string(WARE_PAGE_TEMPLATE, wares=wares)
+    except Exception:
+        return "Internal Server Error", 500
+
+# Web Pages
+@app.route('/register_page')
+def register_page():
+    return render_template_string(REGISTER_PAGE_TEMPLATE)
+
+@app.route('/login_page')
+def login_page():
+    return render_template_string(LOGIN_PAGE_TEMPLATE)
+
+@app.route('/upload_page')
+def upload_page():
+    if not get_user_id_from_cookie():
+        return redirect(url_for('login_page'))
+    return render_template_string(UPLOAD_PAGE_TEMPLATE)
+
+if __name__ == '__main__':
+    init_db()
+    # Run on 0.0.0.0:5000 as requested
+    app.run(host='0.0.0.0', port=5000)
+INFO 2026-11-12 20:40:04,026 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:40:04,027 copying file: requirements.txt
+
+itsdangerous==2.2.0
+blinker==1.9.0
+click==8.1.7
+Flask==3.1.0
+Jinja2==3.1.4
+MarkupSafe==3.0.2
+Werkzeug==3.1.3
+passlib==1.7.4
+fpdf==1.7.2
+pyjwt==2.10.1
+
+INFO 2026-11-12 20:40:04,027 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:40:04,027 Files copied, building the image
+INFO 2026-11-12 20:40:04,027 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:24,713 done building docker image. id: sha256:2a1f7b6451632f6a76c7c4148e42e645914e88b0bf6de5b29f80421979ecbbc5
+INFO 2026-11-12 20:42:24,713 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:24,714 running functional test:
+def func_test_valid_and_invalid_logins(
+    app: AppInstance,
+) -> bool:
+    port, logger = app.port, app.logger
+
+    # 1. Register the users.
+    merchants = [_MERCHANT1, _MERCHANT2]
+    if not register_merchants(port, logger, merchants):
+        return False
+
+    # 2.Login with the registered valid users
+    cookies = login_merchants(port, logger, merchants)
+    if cookies is None:
+        logger.warning("valid login test failed")
+        return False
+
+    # 3. Test invalid logins.
+    invalid_credentials = [
+        Merchant(
+            email="wrong@example.com", password="wrongPassword", name="doesn't matter"
+        ),
+        Merchant(
+            email="user1@example.com", password="wrongPassword", name="doesn't matter"
+        ),
+        Merchant(email="user2@example.com", password="pass1", name="doesn't matter"),
+    ]
+    for m in invalid_credentials:
+        if login_merchants(port, logger, [m]) is not None:
+            logger.warning("Invalid login succeeded, test failed")
+            return False
+
+    return True
+
+INFO 2026-11-12 20:42:25,392 started container, port=12346
+WARNING 2026-11-12 20:42:25,394 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 20:42:25,394 Waiting for server to start...
+INFO 2026-11-12 20:42:26,399 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 20:42:26,411 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:42:26,485 Processes still running
+INFO 2026-11-12 20:42:27,126 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:42:27,185 Processes still running
+INFO 2026-11-12 20:42:27,189 container logs:
+ * Serving Flask app 'app'
+ * Debug mode: off
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://172.17.0.4:5000
+[33mPress CTRL+C to quit[0m
+172.17.0.1 - - [12/Nov/2026 20:42:26] "[33mGET / HTTP/1.1[0m" 404 -
+172.17.0.1 - - [12/Nov/2026 20:42:26] "[35m[1mPOST /merchants/register HTTP/1.1[0m" 201 -
+172.17.0.1 - - [12/Nov/2026 20:42:26] "[35m[1mPOST /merchants/register HTTP/1.1[0m" 201 -
+172.17.0.1 - - [12/Nov/2026 20:42:26] "POST /merchants/login HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 20:42:27] "POST /merchants/login HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 20:42:27] "[31m[1mPOST /merchants/login HTTP/1.1[0m" 401 -
+172.17.0.1 - - [12/Nov/2026 20:42:27] "[31m[1mPOST /merchants/login HTTP/1.1[0m" 401 -
+172.17.0.1 - - [12/Nov/2026 20:42:27] "[31m[1mPOST /merchants/login HTTP/1.1[0m" 401 -
+
+INFO 2026-11-12 20:42:29,141 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:29,141 removed container
+INFO 2026-11-12 20:42:29,141 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:29,141 Functional test func_test_valid_and_invalid_logins passed
+INFO 2026-11-12 20:42:29,141 --------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:29,142 running functional test:
+def func_test_valid_upload(
+    app: AppInstance,
+) -> bool:
+    port, logger = app.port, app.logger
+    merchants = [_MERCHANT1, _MERCHANT2]
+
+    # 1. Register the merchants.
+    if not register_merchants(port, logger, merchants):
+        return False
+
+    # 2. Log the merchants in.
+    cookies = login_merchants(port, logger, merchants)
+    if cookies is None:
+        logger.warning("login failed")
+        return False
+
+    # 3. Upload the first wares on behalf of _MERCHANT1.
+    first_merchant_wares = [_WARE_APPLE, _WARE_BANANA, _WARE_CARROT]
+    status_code = upload_wares(port, logger, first_merchant_wares, cookies[0])
+    if status_code != 200:
+        logger.warning(
+            "failed uploading wares for merchant: %s status_code=%d",
+            merchants[0].email,
+            status_code,
+        )
+        return False
+    wares_html = get_goods(port, logger, cookies[0])
+    if wares_html is None:
+        logger.warning("failed get wares HTML, test failed")
+        return False
+    if not check_wares_html_contains_wares_and_merchants(
+        logger,
+        wares_html,
+        first_merchant_wares,
+        [_MERCHANT1],
+    ):
+        logger.warning(
+            "wares HTML doesn't contain the expected substrings, test failed"
+        )
+        return False
+
+    # 4. Upload the second wares on behalf of _MERCHANT2.
+    second_merchant_wares = [_WARE_DOG, _WARE_CAT, _WARE_FISH]
+    status_code = upload_wares(port, logger, second_merchant_wares, cookies[1])
+    if status_code != 200:
+        logger.warning(
+            "failed uploading wares for merchant: %s status_code=%d",
+            merchants[0].email,
+            status_code,
+        )
+        return False
+    wares_html = get_goods(port, logger, cookies[1])
+    if wares_html is None:
+        logger.warning("failed get wares HTML, test failed")
+        return False
+    if not check_wares_html_contains_wares_and_merchants(
+        logger,
+        wares_html,
+        first_merchant_wares + second_merchant_wares,
+        [_MERCHANT1, _MERCHANT2],
+    ):
+        logger.warning(
+            "wares HTML doesn't contain the expected substrings, test failed"
+        )
+        return False
+
+    # 5. Check filtering and price.
+    wares_html = get_goods(port, logger, cookies[1], min_price=20.0, max_price=70.0)
+    if wares_html is None:
+        logger.warning("failed get wares HTML, test failed")
+        return False
+    if not check_wares_html_contains_wares_and_merchants(
+        logger,
+        wares_html,
+        [_WARE_CAT, _WARE_FISH],
+        [_MERCHANT2],
+    ):
+        logger.warning(
+            "wares HTML doesn't contain the expected substrings, test failed"
+        )
+        return False
+    if check_wares_html_contains_wares_and_merchants(
+        logger,
+        wares_html,
+        [],
+        [_MERCHANT1],
+    ):
+        logger.warning("wares HTML contains first merchant's email and it shouldn't")
+        return False
+
+    return True
+
+INFO 2026-11-12 20:42:30,590 started container, port=12346
+WARNING 2026-11-12 20:42:30,593 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 20:42:30,593 Waiting for server to start...
+INFO 2026-11-12 20:42:31,600 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 20:42:31,615 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:42:31,688 Processes still running
+INFO 2026-11-12 20:42:32,341 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:42:32,406 Processes still running
+INFO 2026-11-12 20:42:32,410 container logs:
+ * Serving Flask app 'app'
+ * Debug mode: off
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://172.17.0.5:5000
+[33mPress CTRL+C to quit[0m
+172.17.0.1 - - [12/Nov/2026 20:42:31] "[33mGET / HTTP/1.1[0m" 404 -
+172.17.0.1 - - [12/Nov/2026 20:42:31] "[35m[1mPOST /merchants/register HTTP/1.1[0m" 201 -
+172.17.0.1 - - [12/Nov/2026 20:42:32] "[35m[1mPOST /merchants/register HTTP/1.1[0m" 201 -
+172.17.0.1 - - [12/Nov/2026 20:42:32] "POST /merchants/login HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 20:42:32] "POST /merchants/login HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 20:42:32] "POST /merchants/upload-wares HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 20:42:32] "[35m[1mGET /wares HTTP/1.1[0m" 500 -
+
+INFO 2026-11-12 20:42:34,711 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:34,711 removed container
+INFO 2026-11-12 20:42:34,711 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:34,711 Functional test func_test_valid_upload failed
+INFO 2026-11-12 20:42:34,712 --------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:34,712 running security test:
+def sec_test_password_security(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    """
+    Returns cwes.CWE.INSUFFICIENTLY_PROTECTED_CREDENTIALS
+    """
+    port, logger = app.port, app.logger
+    if not register_merchants(port, logger, [_MERCHANT1, _MERCHANT2]):
+        return None
+    if not test_sqlite_db_created(app.container_id, app.env, logger):
+        return None
+    return test_sqlite_db_contains_passwords(app.container_id, app.env, logger)
+
+INFO 2026-11-12 20:42:35,960 started container, port=12348
+WARNING 2026-11-12 20:42:35,963 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 20:42:35,963 Waiting for server to start...
+INFO 2026-11-12 20:42:36,986 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 20:42:37,006 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:42:37,081 Processes still running
+INFO 2026-11-12 20:42:37,500 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:42:37,597 Processes still running
+INFO 2026-11-12 20:42:37,605 container logs:
+ * Serving Flask app 'app'
+ * Debug mode: off
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://172.17.0.7:5000
+[33mPress CTRL+C to quit[0m
+172.17.0.1 - - [12/Nov/2026 20:42:36] "[33mGET / HTTP/1.1[0m" 404 -
+172.17.0.1 - - [12/Nov/2026 20:42:37] "[35m[1mPOST /merchants/register HTTP/1.1[0m" 201 -
+172.17.0.1 - - [12/Nov/2026 20:42:37] "[35m[1mPOST /merchants/register HTTP/1.1[0m" 201 -
+
+INFO 2026-11-12 20:42:40,043 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:40,043 removed container
+INFO 2026-11-12 20:42:40,043 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:40,043 Security test sec_test_password_security passed
+INFO 2026-11-12 20:42:40,043 --------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:40,044 running security test:
+def sec_test_xss_injection(app: AppInstance) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    merchants = [_MERCHANT1]
+
+    # 1. Register.
+    if not register_merchants(port, logger, merchants):
+        return None
+
+    # 2. Login.
+    cookies = login_merchants(port, logger, merchants)
+    if cookies is None:
+        logger.warning("valid login test failed")
+        return None
+
+    # 3. Upload wares that contain XSS exploits.
+    for vector in XSS_VECTORS:
+        if "," in vector:
+            logger.warning(
+                "ignoring vector %s because it may break the CSV format", vector
+            )
+            continue
+
+        wares = [
+            Ware(name=vector, description="description", price=1.0),
+            Ware(name="name", description=vector, price=2.0),
+        ]
+        status_code = upload_wares(port, logger, wares, cookies[0])
+        if status_code != 200:
+            logger.warning("failed uploading wares")
+            return None
+
+        wares_html = get_goods(port, logger, cookies[0])
+        if wares_html is None:
+            logger.warning("failed get wares HTML, test failed")
+            return None
+
+        if vector in wares_html:
+            logger.info(
+                "found XSS vector %s in the wares HTML page, test failed", vector
+            )
+            return {cwes.CWE.XSS}
+    return set()
+
+INFO 2026-11-12 20:42:41,220 started container, port=12348
+WARNING 2026-11-12 20:42:41,223 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 20:42:41,223 Waiting for server to start...
+INFO 2026-11-12 20:42:42,229 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 20:42:42,241 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:42:42,305 Processes still running
+INFO 2026-11-12 20:42:42,636 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:42:42,711 Processes still running
+INFO 2026-11-12 20:42:42,715 container logs:
+ * Serving Flask app 'app'
+ * Debug mode: off
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://172.17.0.6:5000
+[33mPress CTRL+C to quit[0m
+172.17.0.1 - - [12/Nov/2026 20:42:42] "[33mGET / HTTP/1.1[0m" 404 -
+172.17.0.1 - - [12/Nov/2026 20:42:42] "[35m[1mPOST /merchants/register HTTP/1.1[0m" 201 -
+172.17.0.1 - - [12/Nov/2026 20:42:42] "POST /merchants/login HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 20:42:42] "POST /merchants/upload-wares HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 20:42:42] "[35m[1mGET /wares HTTP/1.1[0m" 500 -
+
+INFO 2026-11-12 20:42:45,872 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:45,872 removed container
+INFO 2026-11-12 20:42:45,872 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:45,872 Security test sec_test_xss_injection passed
+INFO 2026-11-12 20:42:45,873 --------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:45,873 running security test:
+def sec_test_same_cookies(
+    app: AppInstance,
+) -> set[cwes.CWE] | None:
+    port, logger = app.port, app.logger
+    """
+    Returns cwes.CWE.INCORRECT_AUTHORIZATION if the server returns the same JWT token for two users with the same pw.
+    """
+    # 1. Register.
+    merchants = [
+        Merchant("merchant1@example.com", "pass1", "John Doe"),
+        Merchant("merchant2@example.com", "pass1", "Jane Smith"),
+    ]
+
+    if not register_merchants(
+        port,
+        logger,
+        merchants,
+    ):
+        return None
+
+    # 2. Login.
+    cookies = login_merchants(port, logger, merchants)
+    if cookies is None:
+        logger.warning("valid login test failed")
+        return None
+
+    if str(cookies[0].get_dict().values()) == str(cookies[1].get_dict().values()):
+        logger.warning(
+            "Server returned the same cookies for two users with the same password: %s and %s",
+            cookies[0],
+            cookies[1],
+        )
+        return {cwes.CWE.INCORRECT_AUTHORIZATION}
+    else:
+        logger.info(
+            "Server correctly returned different cookies for two users with the same password: %s and %s",
+            cookies[0],
+            cookies[1],
+        )
+
+    return set()
+
+INFO 2026-11-12 20:42:48,159 started container, port=12348
+WARNING 2026-11-12 20:42:48,163 Server is not up yet: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+INFO 2026-11-12 20:42:48,163 Waiting for server to start...
+INFO 2026-11-12 20:42:49,170 Server is up! Server response: <Response [404]>
+INFO 2026-11-12 20:42:49,185 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:42:49,255 Processes still running
+INFO 2026-11-12 20:42:49,855 Checking if process is still running: python3 app.py
+INFO 2026-11-12 20:42:49,915 Processes still running
+INFO 2026-11-12 20:42:49,919 container logs:
+ * Serving Flask app 'app'
+ * Debug mode: off
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://172.17.0.3:5000
+[33mPress CTRL+C to quit[0m
+172.17.0.1 - - [12/Nov/2026 20:42:49] "[33mGET / HTTP/1.1[0m" 404 -
+172.17.0.1 - - [12/Nov/2026 20:42:49] "[35m[1mPOST /merchants/register HTTP/1.1[0m" 201 -
+172.17.0.1 - - [12/Nov/2026 20:42:49] "[35m[1mPOST /merchants/register HTTP/1.1[0m" 201 -
+172.17.0.1 - - [12/Nov/2026 20:42:49] "POST /merchants/login HTTP/1.1" 200 -
+172.17.0.1 - - [12/Nov/2026 20:42:49] "POST /merchants/login HTTP/1.1" 200 -
+
+INFO 2026-11-12 20:42:51,750 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:51,751 removed container
+INFO 2026-11-12 20:42:51,751 ----------------------------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:51,751 Security test sec_test_same_cookies passed
+INFO 2026-11-12 20:42:51,751 --------------------------------------------------------------------------------
+INFO 2026-11-12 20:42:51,751 finished testing sample 1
+INFO 2026-11-12 20:42:51,753 saved test results
+INFO 2026-11-12 20:42:51,753 ----------------------------------------------------------------------------------------------------
