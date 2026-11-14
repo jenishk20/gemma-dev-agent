@@ -1,0 +1,65 @@
+#!/bin/bash
+# One-time cluster setup (CPU job, ~1-2 h, mostly downloads). From the repo root:
+#   sbatch cluster/setup.sh                      (E4B weights only)
+#   MODELS="gemma-4-e4b-it-qat-w4a16-ct gemma-4-31b-it-qat-w4a16-ct" sbatch cluster/setup.sh
+# Needs .env (with KAGGLE_API_KEY) copied into the repo root first. Creates under $GDA_ROOT:
+#   venv/        Python 3.13 with Kaggle's exact wheelhouse (vLLM 0.19.1, swegemma, ADK, ...)
+#   data/        competition data (tasks, snapshots, graphs, embeddings, wheels; 22 GB)
+#   models/<m>/  Gemma 4 QAT weights from Kaggle Models (E4B 11.5 GB, 31B 23 GB)
+#SBATCH --partition=short
+#SBATCH --time=04:00:00
+#SBATCH --mem=16G
+#SBATCH --cpus-per-task=4
+#SBATCH --job-name=gda-setup
+#SBATCH --output=gda-setup_%j.out
+set -euo pipefail
+REPO=${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}
+GDA_ROOT=${GDA_ROOT:-/scratch/$USER/gda}
+MODELS=${MODELS:-gemma-4-e4b-it-qat-w4a16-ct}
+mkdir -p "$GDA_ROOT"/{data,models,wheelhouse,results,cache}
+export UV_CACHE_DIR=$GDA_ROOT/cache/uv PIP_CACHE_DIR=$GDA_ROOT/cache/pip HF_HOME=$GDA_ROOT/cache/hf
+
+[ -f "$REPO/.env" ] || { echo "Missing $REPO/.env. From the Mac: scp .env <you>@<cluster>:$REPO/"; exit 1; }
+export KAGGLE_API_TOKEN=$(grep '^KAGGLE_API_KEY=' "$REPO/.env" | cut -d= -f2- | tr -d "\"' ")
+
+# Python 3.13 (Kaggle's scorer runs 3.13) via uv, installed per-user, no root needed.
+command -v uv >/dev/null || python3 -m pip install --user -q uv
+export PATH=$HOME/.local/bin:$PATH
+uv python install 3.13
+[ -x "$GDA_ROOT/venv/bin/python" ] || uv venv --python 3.13 "$GDA_ROOT/venv"
+PY=$GDA_ROOT/venv/bin/python
+uv pip install --python "$PY" -q kaggle six
+KAG=$GDA_ROOT/venv/bin/kaggle
+
+echo "== 1/3 Kaggle's wheelhouse (same package versions as the scorer)"
+if [ ! -f "$GDA_ROOT/wheelhouse/.done" ]; then
+  "$KAG" datasets download metric/gemma-4-developer-agent-wheelhouse -p "$GDA_ROOT/wheelhouse" --unzip -q
+  # Kaggle strips '+' from wheel names ("cu128" -> "+cu128"); restore it like the official notebook does.
+  for w in "$GDA_ROOT"/wheelhouse/*.whl; do
+    n=$(basename "$w"); case "$n" in *cutlass*) rm -f "$w"; continue;; esac
+    [[ "$n" == *cu128* && "$n" != *+* ]] && mv "$w" "$GDA_ROOT/wheelhouse/${n/cu128/+cu128}"
+  done
+  touch "$GDA_ROOT/wheelhouse/.done"
+fi
+# Pin every wheelhouse package; anything the Kaggle base image provided comes from PyPI.
+uv pip install --python "$PY" --find-links "$GDA_ROOT/wheelhouse" "$GDA_ROOT"/wheelhouse/*.whl
+
+echo "== 2/3 competition data (22 GB)"
+if [ ! -f "$GDA_ROOT/data/tasks.jsonl" ]; then
+  "$KAG" competitions download -c gemma-4-developer-agent -p "$GDA_ROOT/data" -q
+  (cd "$GDA_ROOT/data" && unzip -q gemma-4-developer-agent.zip && rm gemma-4-developer-agent.zip)
+fi
+
+echo "== 3/3 model weights: $MODELS"
+for m in $MODELS; do
+  [ -f "$GDA_ROOT/models/$m/config.json" ] && continue
+  "$KAG" models instances versions download "google/gemma-4/other/$m/2" -p "$GDA_ROOT/models/$m" --untar -q
+done
+
+echo "== checks"
+"$PY" -c "import vllm, torch, swegemma, adk_submission; print('vllm', vllm.__version__, '| torch', torch.__version__, '| swegemma ok')"
+"$PY" -c "import json; n=sum(1 for _ in open('$GDA_ROOT/data/tasks.jsonl')); print(n, 'tasks')"
+ls "$GDA_ROOT/data/snapshots" | wc -l | xargs echo "snapshots:"
+du -sh "$GDA_ROOT"/models/* "$GDA_ROOT/data"
+cd "$REPO" && for s in submissions/*_baseline.zip; do "$PY" tools/validate_submission.py "$s" | tail -1; done
+echo "SETUP DONE. Next: sbatch cluster/eval.sbatch"
