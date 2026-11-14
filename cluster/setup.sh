@@ -3,7 +3,7 @@
 #   sbatch cluster/setup.sh                      (E4B weights only)
 #   MODELS="gemma-4-e4b-it-qat-w4a16-ct gemma-4-31b-it-qat-w4a16-ct" sbatch cluster/setup.sh
 # Needs .env (with KAGGLE_API_KEY) copied into the repo root first. Creates under $GDA_ROOT:
-#   venv/        Python 3.13 with Kaggle's exact wheelhouse (vLLM 0.19.1, swegemma, ADK, ...)
+#   venv/        Python 3.12 with Kaggle's exact wheelhouse (vLLM 0.19.1, swegemma, ADK, ...)
 #   data/        competition data (tasks, snapshots, graphs, embeddings, wheels; 22 GB)
 #   models/<m>/  Gemma 4 QAT weights from Kaggle Models (E4B 11.5 GB, 31B 23 GB)
 #SBATCH --partition=short
@@ -33,11 +33,16 @@ echo "repo: $REPO | all downloads and installs go to: $GDA_ROOT"
 [ -f "$REPO/.env" ] || { echo "Missing $REPO/.env. From the Mac: scp .env <you>@<cluster>:$REPO/"; exit 1; }
 export KAGGLE_API_TOKEN=$(grep '^KAGGLE_API_KEY=' "$REPO/.env" | cut -d= -f2- | tr -d "\"' ")
 
-# Python 3.13 (Kaggle's scorer runs 3.13) via uv; uv itself lives in a small bootstrap venv.
+# Python 3.12: Kaggle's wheelhouse ships cp312 wheels (e.g. apache_tvm_ffi), so the scorer runs 3.12.
+# uv itself lives in a small bootstrap venv.
+PYVER=3.12
 [ -x "$GDA_ROOT/bootstrap/bin/uv" ] || { python3 -m venv "$GDA_ROOT/bootstrap" && "$GDA_ROOT/bootstrap/bin/pip" install -q uv; }
 export PATH=$GDA_ROOT/bootstrap/bin:$PATH
-uv python install 3.13
-[ -x "$GDA_ROOT/venv/bin/python" ] || uv venv --python 3.13 "$GDA_ROOT/venv"
+uv python install $PYVER
+if [ -x "$GDA_ROOT/venv/bin/python" ] && ! "$GDA_ROOT/venv/bin/python" -c "import sys; sys.exit(sys.version_info[:2] != tuple(map(int, '$PYVER'.split('.'))))"; then
+  echo "existing venv is not Python $PYVER; recreating it"; rm -rf "$GDA_ROOT/venv"
+fi
+[ -x "$GDA_ROOT/venv/bin/python" ] || uv venv --python $PYVER "$GDA_ROOT/venv"
 PY=$GDA_ROOT/venv/bin/python
 uv pip install --python "$PY" -q kaggle six
 KAG=$GDA_ROOT/venv/bin/kaggle
@@ -52,8 +57,10 @@ if [ ! -f "$GDA_ROOT/wheelhouse/.done" ]; then
   done
   touch "$GDA_ROOT/wheelhouse/.done"
 fi
-# Pin every wheelhouse package; anything the Kaggle base image provided comes from PyPI.
-uv pip install --python "$PY" --find-links "$GDA_ROOT/wheelhouse" "$GDA_ROOT"/wheelhouse/*.whl
+# Install the tested lock: Kaggle's 41 wheels from the wheelhouse at their exact versions, everything the Kaggle
+# base image provided (torch, numpy, ...) from PyPI. overrides.txt settles the set's two internal conflicts.
+uv pip install --python "$PY" --find-links "$GDA_ROOT/wheelhouse" \
+  --override "$REPO/cluster/overrides.txt" -r "$REPO/cluster/requirements-lock.txt"
 
 echo "== 2/3 competition data (22 GB)"
 if [ ! -f "$GDA_ROOT/data/tasks.jsonl" ]; then
