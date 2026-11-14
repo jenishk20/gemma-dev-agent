@@ -31,6 +31,10 @@ for k, v in {"VLLM_NO_USAGE_STATS": "1", "VLLM_WORKER_MULTIPROC_METHOD": "spawn"
              "LITELLM_LOG": "WARNING", "OPENAI_API_KEY": "EMPTY", "OTEL_SDK_DISABLED": "true",
              "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}.items():
     os.environ.setdefault(k, v)
+# Clusters often route traffic through an HTTP proxy (http_proxy/https_proxy). Calls to the local vLLM server
+# (health check, agent requests) must bypass it, or they go to the proxy and never reach 127.0.0.1:8000.
+for k in ("NO_PROXY", "no_proxy"):
+    os.environ[k] = ",".join(x for x in (os.environ.get(k, ""), "127.0.0.1,localhost,::1") if x)
 
 
 def pick_tasks(tasks, limit, task_ids, seed):
