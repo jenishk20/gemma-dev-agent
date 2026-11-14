@@ -29,4 +29,8 @@ sbatch cluster/eval.sbatch         # smoke test: E4B baseline on 10 tasks
 git pull && SUB=submissions/<name> N=0 sbatch cluster/eval.sbatch   # N=0 = all 129 tasks
 ```
 
+**From OOD Job Composer** (no `sbatch` in the Apptainer shell): paste `cluster/ood_eval.sh` as the job script once, edit its
+`SUB` / `N` / `C` lines per run, and submit. It runs the repo's `cluster/eval.sbatch`, so a `git pull` is enough to pick up fixes.
+Logs always land in `/scratch/phalle.y/gemma-dev-agent/gda-eval_<jobid>.out`, whichever way you submit.
+
 Before the first run, accept the Gemma 4 license on its Kaggle model page (kaggle.com/models/google/gemma-4), or the weight download is refused.
