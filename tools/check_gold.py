@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -56,9 +57,16 @@ def main():
             t0 = time.perf_counter()
             r = await verify_task(ev.docker, cfg, task, snap, base_snapshot_path=base, patch_path=patch,
                                   agent_patch=task.patch, start_time=t0)
-            tail = " | ".join((r.test_output or r.error or "").strip().splitlines()[-4:])[:500]
+            text = r.test_output or r.error or ""
+            (out / f"{task.instance_id}.log").write_text(text)
+            lines = text.strip().splitlines()
+            # the first distinct error lines (ImportError, fixture errors, ...) say more than the summary
+            errs = list(dict.fromkeys(l.strip()[:220] for l in lines if l.startswith("E ") or "Error:" in l))[:4]
             print(f"{task.instance_id:16s} resolved={r.resolved!s:5s} exit={r.test_exit_code} "
-                  f"{time.perf_counter() - t0:.0f}s\n    {tail}", flush=True)
+                  f"{time.perf_counter() - t0:.0f}s | {next((l for l in reversed(lines) if re.search(r'passed|failed|error', l)), '')[:160]}", flush=True)
+            if not r.resolved:
+                for e in errs:
+                    print("      ", e, flush=True)
             return r
 
     async def run():
@@ -67,7 +75,8 @@ def main():
 
     rs = asyncio.run(run())
     ok = sum(r.resolved for r in rs)
-    print(f"\nOFFICIAL FIX PASSES: {ok}/{len(rs)}  "
+    print(f"\nfull test logs: {out}/<task>.log")
+    print(f"OFFICIAL FIX PASSES: {ok}/{len(rs)}  "
           + ("-> test setup works; the 0 score is the model" if ok >= 0.8 * len(rs)
              else "-> test setup is broken on this machine; fix it before trusting any score"))
 
