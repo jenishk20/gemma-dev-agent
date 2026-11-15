@@ -32,7 +32,7 @@ OVERLAYS = ROOT / "testdeps" / "overlays"
 REQ_FILE = re.compile(r"^(requirements|test-requirements|dev-requirements)[\w.-]*\.txt$")
 TEST_GROUPS = re.compile(r"^(test|tests|testing|all)$")         # pyproject extras / dependency groups we read
 DEV_GROUPS = re.compile(r"^(dev|develop|development)$")          # only if a repo has no test group at all
-SKIP_INCLUDE = re.compile(r"doc|lint|translat|release|github|typing")  # e.g. fastapi's dev -> docs, translations
+SKIP_INCLUDE = re.compile(r"doc|lint|translat|release|github|typing|screenshot")  # groups/files for docs etc.
 # Not needed to run tests (linters, type checkers, browsers), or pytest plugins that change how every test run
 # behaves (random order, parallel workers, fancy output). Kaggle's base set leaves out pytest-xdist the same way.
 SKIP_REQS = {"mypy", "ruff", "ty", "black", "isort", "flake8", "pylint", "pyright", "pre_commit", "prek", "zizmor",
@@ -61,8 +61,9 @@ def declared(files, repo=""):
     out, direct, own = [], set(), norm(repo.split("/")[-1]) if repo else ""
 
     def from_txt(name, seen):
-        if name in seen or name not in files:
-            return
+        base = Path(name).name
+        if name in seen or name not in files or (SKIP_INCLUDE.search(base) and "test" not in base):
+            return                                       # e.g. requirements.txt -> -r requirements-docs.txt
         seen.add(name)
         for line in files[name].splitlines():
             line = line.split(" #")[0].strip()
@@ -73,7 +74,7 @@ def declared(files, repo=""):
 
     seen = set()
     for name in sorted(files):
-        if name.endswith(".txt") and "docs" not in name:
+        if name.endswith(".txt"):
             from_txt(name, seen)
     if "pyproject.toml" in files:
         try:

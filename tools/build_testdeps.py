@@ -101,6 +101,8 @@ def main():
     print(f"{wheels}: {len(files)} wheels usable as-is, {len(reqs)} to fetch for {pyver}; target {target}", flush=True)
     if target.exists():
         shutil.rmtree(target)
+    # Per-task overlays are computed against this base set; rebuild them lazily after the base changes.
+    shutil.rmtree(target.parent / "overlays", ignore_errors=True)
     target.mkdir(parents=True)
 
     # The base set only needs the right packages; exact versions per task come from the overlay (tools/testenv.py).
