@@ -64,6 +64,9 @@ if [ ! -f "$GDA_ROOT/data/tasks.jsonl" ]; then
   (cd "$GDA_ROOT/data" && unzip -q gemma-4-developer-agent.zip && rm gemma-4-developer-agent.zip)
 fi
 
+echo "== test libraries for the sandboxes (pytest + data/wheels, separate from the venv)"
+[ -f "$GDA_ROOT/testdeps/.done" ] || "$PY" "$REPO/tools/build_testdeps.py"
+
 echo "== 3/3 model weights: $MODELS"
 for m in $MODELS; do
   [ -f "$GDA_ROOT/models/$m/config.json" ] && continue

@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from run_local_eval import ROOT, pick_tasks  # noqa: E402  (also sets the proxy bypass and env defaults)
+from run_local_eval import ROOT, pick_tasks, use_testdeps  # noqa: E402  (also sets the proxy bypass and env defaults)
 
 
 def main():
@@ -36,6 +36,7 @@ def main():
     from swegemma.harness.verification import verify_task
     from swegemma.models import load_tasks
 
+    use_testdeps()
     data = Path(args.data)
     ids = args.task_ids
     if args.from_results:

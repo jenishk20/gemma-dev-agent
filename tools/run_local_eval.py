@@ -37,6 +37,32 @@ for k in ("NO_PROXY", "no_proxy"):
     os.environ[k] = ",".join(x for x in (os.environ.get(k, ""), "127.0.0.1,localhost,::1") if x)
 
 
+def use_testdeps(testdeps=ROOT / "testdeps" / "site-packages"):
+    """Give every subprocess sandbox the test libraries (pytest + repo test deps) built by tools/build_testdeps.py.
+
+    In subprocess mode swegemma installs no test deps; each sandbox venv just lists the host's site-packages in a
+    _host_env.pth file. We put the testdeps folder first in that file, so tests see the competition's test wheels
+    (like Kaggle's sandbox image) before anything from the vLLM venv.
+    """
+    testdeps = Path(testdeps)
+    assert (testdeps / "pytest").is_dir(), f"no pytest in {testdeps}: run tools/build_testdeps.py first"
+    from swegemma.sandbox.subprocess import SubprocessManager
+    if getattr(SubprocessManager.start, "_testdeps", False):
+        return
+    orig = SubprocessManager.start
+
+    def start(self, *a, **kw):
+        sid = orig(self, *a, **kw)
+        for sp in self._sandboxes[sid]["venv"].glob("lib/python*/site-packages"):
+            pth = sp / "_host_env.pth"
+            rest = pth.read_text(encoding="utf-8") if pth.exists() else ""
+            pth.write_text(f"{testdeps}\n{rest}", encoding="utf-8")
+        return sid
+
+    start._testdeps = True
+    SubprocessManager.start = start
+
+
 def pick_tasks(tasks, limit, task_ids, seed):
     if task_ids:
         return [t for t in tasks if t.instance_id in set(task_ids)]
@@ -69,6 +95,7 @@ def main():
     from swegemma.models import load_tasks
 
     litellm.drop_params = True
+    use_testdeps()
     sub, data = Path(args.submission).resolve(), Path(args.data)
     models = discover_declared_models(sub)
     assert len(models) == 1 and next(iter(models)) in ALLOWED, f"declared models: {sorted(models)}"
