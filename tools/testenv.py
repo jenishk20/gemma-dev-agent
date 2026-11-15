@@ -13,6 +13,7 @@ In subprocess mode swegemma skips all of that, so we do it here instead:
   source   <workspace>/src for src-layout repos (requests), so tests import the patched code, not a wheel.
 
 Search order inside every sandbox: source, overlay, base, then the host venv (via the sandbox's _host_env.pth).
+Task folders live in $GDA_ROOT/sandboxes/<slurm job id>/ (not /tmp) and are deleted as each task ends.
 """
 import hashlib
 import os
@@ -28,6 +29,8 @@ from pathlib import Path
 ROOT = Path(os.environ.get("GDA_ROOT", Path(__file__).resolve().parents[2] / "gda"))
 BASE = ROOT / "testdeps" / "site-packages"
 OVERLAYS = ROOT / "testdeps" / "overlays"
+# Per-task working folders (repo copy + small venv), one subfolder per job; each is deleted when its task ends.
+SANDBOXES = ROOT / "sandboxes" / os.environ.get("SLURM_JOB_ID", f"pid{os.getpid()}")
 
 REQ_FILE = re.compile(r"^(requirements|test-requirements|dev-requirements)[\w.-]*\.txt$")
 TEST_GROUPS = re.compile(r"^(test|tests|testing|all)$")         # pyproject extras / dependency groups we read
@@ -222,6 +225,18 @@ def install():
     if getattr(SubprocessManager.start, "_testenv", False):
         return
     base = installed(BASE)
+
+    # Task folders go under $GDA_ROOT (scratch), not the node's /tmp. Removed at exit, even if some task left one.
+    import atexit
+    orig_init = SubprocessManager.__init__
+
+    def init(self, *a, **kw):
+        orig_init(self, *a, **kw)
+        if self.base_dir is None:
+            SANDBOXES.mkdir(parents=True, exist_ok=True)
+            self.base_dir = SANDBOXES
+    SubprocessManager.__init__ = init
+    atexit.register(shutil.rmtree, SANDBOXES, ignore_errors=True)
 
     def write_path(mgr, sid, first=()):
         info = mgr._sandboxes[sid]
