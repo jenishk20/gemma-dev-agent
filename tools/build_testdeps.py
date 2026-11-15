@@ -5,7 +5,8 @@
 Why: in subprocess mode swegemma skips installing test dependencies and lets each sandbox borrow the host Python's
 packages. Kaggle's machines have pytest etc. preinstalled; our vLLM venv does not, so every test run failed with
 "No module named pytest". This mirrors Kaggle's sandbox image (docker/Dockerfile.sandbox): pytest, pytest-timeout==2.1.0,
-plus the competition's own test wheels (data/wheels, highest version per package, like swegemma's _deduplicate_wheels).
+plus each repo's own declared test requirements (read from its snapshot: requirements*.txt, pyproject.toml), then the
+competition's own wheels on top (data/wheels, highest version per package, like swegemma's _deduplicate_wheels).
 It goes into a separate folder, never the vLLM venv; tools/run_local_eval.py puts it first on the sandbox's path.
 Compiled wheels built only for Python 3.13 are fetched for our Python (3.12) at the same version from PyPI.
 """
@@ -51,6 +52,66 @@ def pick(wheels_dir, py_tag):
     return files, reqs
 
 
+REQ_FILE = re.compile(r"^(requirements|test-requirements|dev-requirements)[\w.-]*\.txt$")
+GROUPS = re.compile(r"^(test|tests|testing|dev|develop|development)$")
+
+
+def repo_test_requirements(data):
+    """Each repo's own declared test needs, read from one code snapshot per repo (data/wheels is only a partial set).
+
+    Reads requirements*.txt (following -r includes) and pyproject.toml: runtime deps plus test/dev extras and
+    dependency groups. Skips the repo's own package and editable/local lines.
+    """
+    import tarfile
+    import tomllib
+    from swegemma.deduplication import resolve_task_snapshot_paths
+    from swegemma.models import load_tasks
+    first = {}
+    for t in load_tasks(data / "tasks.jsonl"):
+        first.setdefault(t.repo, t)
+    specs = {}
+    for repo, t in sorted(first.items()):
+        snap = resolve_task_snapshot_paths(data / "snapshots", t.instance_id, t.repo)[0]
+        files = {}
+        with tarfile.open(snap, "r|gz") as tf:          # stream: read only the small requirement files
+            for m in tf:
+                rel = m.name.lstrip("./")
+                if m.isfile() and rel.count("/") <= 1 and (REQ_FILE.match(Path(rel).name) or rel == "pyproject.toml"):
+                    files[rel] = tf.extractfile(m).read().decode("utf-8", "replace")
+        own = norm(repo.split("/")[-1])
+        out = []
+
+        def from_txt(name, seen):
+            if name in seen or name not in files:
+                return
+            seen.add(name)
+            for line in files[name].splitlines():
+                line = line.split(" #")[0].strip()
+                if line.startswith(("-r ", "--requirement ")):
+                    from_txt(str(Path(name).parent / line.split(None, 1)[1]).lstrip("./"), seen)
+                elif line and not line.startswith(("#", "-", ".", "/", "git+", "http://", "https://")):
+                    out.append(line)
+        seen = set()
+        for name in sorted(files):
+            if name.endswith(".txt") and "docs" not in name:
+                from_txt(name, seen)
+        if "pyproject.toml" in files:
+            try:
+                py = tomllib.loads(files["pyproject.toml"])
+                proj = py.get("project", {})
+                out += proj.get("dependencies", [])
+                for g, deps in {**proj.get("optional-dependencies", {}), **py.get("dependency-groups", {})}.items():
+                    if GROUPS.match(g):
+                        out += [d for d in deps if isinstance(d, str)]
+            except Exception as e:
+                print(f"  {repo}: could not read pyproject.toml ({e})")
+        keep = [d for d in out if not norm(re.split(r"[\s\[<>=!~;]", d, maxsplit=1)[0]).startswith(own)]
+        print(f"  {repo}: {len(keep)} declared requirements from {', '.join(sorted(files)) or 'nothing'}")
+        for d in keep:
+            specs.setdefault(d, repo)
+    return list(specs)
+
+
 def uv_install(uv, py, target, items, *extra):
     cmd = [uv, "pip", "install", "--python", py, "--target", str(target), *extra, *items]
     return subprocess.run(cmd, capture_output=True, text=True)
@@ -73,9 +134,15 @@ def main():
         shutil.rmtree(target)
     target.mkdir(parents=True)
 
-    r = uv_install(args.uv, args.python, target, BASE)
+    declared = repo_test_requirements(Path(args.wheels).parent)
+    r = uv_install(args.uv, args.python, target, BASE + declared)
     if r.returncode:
-        sys.exit(f"pytest install failed:\n{r.stderr[-3000:]}")
+        print(f"could not resolve all declared test requirements together:\n{r.stderr[-1500:]}\ninstalling one by one")
+        if uv_install(args.uv, args.python, target, BASE).returncode:
+            sys.exit("pytest install failed")
+        for d in declared:
+            if uv_install(args.uv, args.python, target, [d]).returncode:
+                print(f"  SKIPPED declared requirement: {d}")
     # Test wheels: --no-deps like the harness (it unpacks wheels, it does not resolve them). Batch first, then one by one.
     items, skipped = files + reqs, []
     r = uv_install(args.uv, args.python, target, items, "--no-deps", "--find-links", str(wheels))
