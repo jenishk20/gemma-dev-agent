@@ -62,7 +62,7 @@ def declared(files, repo=""):
 
     def from_txt(name, seen):
         base = Path(name).name
-        if name in seen or name not in files or (SKIP_INCLUDE.search(base) and "test" not in base):
+        if name in seen or name not in files or (SKIP_INCLUDE.search(name) and "test" not in base):
             return                                       # e.g. requirements.txt -> -r requirements-docs.txt
         seen.add(name)
         for line in files[name].splitlines():

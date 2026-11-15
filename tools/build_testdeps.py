@@ -94,15 +94,14 @@ def main():
     ap.add_argument("--uv", default=shutil.which("uv") or str(ROOT / "bootstrap" / "bin" / "uv"))
     args = ap.parse_args()
 
-    wheels, target = Path(args.wheels), Path(args.target)
+    wheels, final = Path(args.wheels), Path(args.target)
+    # Build next to the real folder and swap at the end: a stopped or failed build leaves the old set working.
+    target = final.with_name(final.name + ".new")
     pyver = subprocess.run([args.python, "-c", "import sys; print(f'cp{sys.version_info[0]}{sys.version_info[1]}')"],
                            capture_output=True, text=True, check=True).stdout.strip()
     files, reqs = pick(wheels, pyver)
-    print(f"{wheels}: {len(files)} wheels usable as-is, {len(reqs)} to fetch for {pyver}; target {target}", flush=True)
-    if target.exists():
-        shutil.rmtree(target)
-    # Per-task overlays are computed against this base set; rebuild them lazily after the base changes.
-    shutil.rmtree(target.parent / "overlays", ignore_errors=True)
+    print(f"{wheels}: {len(files)} wheels usable as-is, {len(reqs)} to fetch for {pyver}; target {final}", flush=True)
+    shutil.rmtree(target, ignore_errors=True)
     target.mkdir(parents=True)
 
     # The base set only needs the right packages; exact versions per task come from the overlay (tools/testenv.py).
@@ -151,9 +150,20 @@ def main():
                            capture_output=True, text=True)
     print(check.stdout.strip() or check.stderr.strip()[-500:])
     n = len([p for p in target.iterdir() if p.name.endswith(".dist-info")])
-    print(f"installed {n} packages into {target}" + (f"; SKIPPED {len(skipped)}: {', '.join(skipped)}" if skipped else ""))
-    (target.parent / ".done").write_text("ok\n")
-    return 0 if check.returncode == 0 else 1
+    if check.returncode:
+        print(f"pytest does not import from the new set; kept the old one. Partial build left in {target}")
+        return 1
+    old = final.with_name(final.name + ".old")
+    shutil.rmtree(old, ignore_errors=True)
+    if final.exists():
+        final.rename(old)
+    target.rename(final)
+    shutil.rmtree(old, ignore_errors=True)
+    # Per-task overlays are computed against this base set; rebuild them lazily after the base changes.
+    shutil.rmtree(final.parent / "overlays", ignore_errors=True)
+    print(f"installed {n} packages into {final}" + (f"; SKIPPED {len(skipped)}: {', '.join(skipped)}" if skipped else ""))
+    (final.parent / ".done").write_text("ok\n")
+    return 0
 
 
 if __name__ == "__main__":

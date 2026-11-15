@@ -35,4 +35,10 @@ if [ "$DRV" -lt 575 ]; then PYX=$GDA_ROOT/venv/bin/python source cluster/cuda_co
 "$GDA_ROOT/venv/bin/python" -c "
 import torch; x = torch.randn(256, 256, device='cuda'); torch.cuda.synchronize()
 print('GPU check ok:', torch.cuda.get_device_name(0), '| torch', torch.__version__, '| sum', round(float((x @ x).sum()), 2))"
+# Test libraries for the sandboxes (pytest + each repo's test needs). Built here if missing, e.g. after an
+# interrupted rebuild; takes a few minutes and needs internet (PyPI).
+if [ ! -d "$GDA_ROOT/testdeps/site-packages/pytest" ]; then
+  echo "no test libraries in $GDA_ROOT/testdeps yet: building them now"
+  PATH=$GDA_ROOT/bootstrap/bin:$PATH UV_CACHE_DIR=$GDA_ROOT/cache/uv "$GDA_ROOT/venv/bin/python" tools/build_testdeps.py
+fi
 "$GDA_ROOT/venv/bin/python" tools/run_local_eval.py --submission "$SUB" --limit "$N" --concurrency "$C"
