@@ -62,6 +62,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--gpu-mem", type=float, default=0.90)
+    ap.add_argument("--port", type=int, default=0, help="vLLM port (0 = any free one, so two jobs on one node never clash)")
     args = ap.parse_args()
 
     import litellm
@@ -87,8 +88,13 @@ def main():
     amap = getattr(adapters, "adapters", None) or {}
     ranks = [r for i in amap.values() if (r := getattr(i, "rank", None))]
     gpus = torch.cuda.device_count()
+    if not args.port:
+        import socket
+        with socket.socket() as sk:
+            sk.bind(("127.0.0.1", 0))
+            args.port = sk.getsockname()[1]
     server = VllmServer(VllmConfig(
-        model=str(model_path), port=8000, host="127.0.0.1", tool_call_parser="gemma4", reasoning_parser="gemma4",
+        model=str(model_path), port=args.port, host="127.0.0.1", tool_call_parser="gemma4", reasoning_parser="gemma4",
         max_model_len=32768, dtype="bfloat16", gpu_memory_utilization=args.gpu_mem, enable_auto_tool_choice=True,
         enable_lora=bool(amap), max_loras=max(1, len(amap)), max_lora_rank=max(ranks) if ranks else 128,
         scheduler_reserve_full_isl=False, tensor_parallel_size=4 if gpus >= 4 else (2 if gpus >= 2 else 1),
@@ -101,7 +107,7 @@ def main():
     results.mkdir(parents=True, exist_ok=True)
     (results / "run_args.json").write_text(json.dumps({**vars(args), "model": model, "eval_config": ev,
                                                        "task_ids": [t.instance_id for t in tasks]}, indent=1))
-    print(f"model={model} gpus={gpus} tasks={len(tasks)} concurrency={args.concurrency} budgets={ev} -> {results}", flush=True)
+    print(f"model={model} gpus={gpus} port={args.port} tasks={len(tasks)} concurrency={args.concurrency} budgets={ev} -> {results}", flush=True)
 
     server.start()
     try:
