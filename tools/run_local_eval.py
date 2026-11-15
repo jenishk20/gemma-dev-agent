@@ -14,7 +14,6 @@ import asyncio
 import json
 import os
 import random
-import re
 import sys
 import time
 from pathlib import Path
@@ -37,30 +36,11 @@ for k in ("NO_PROXY", "no_proxy"):
     os.environ[k] = ",".join(x for x in (os.environ.get(k, ""), "127.0.0.1,localhost,::1") if x)
 
 
-def use_testdeps(testdeps=ROOT / "testdeps" / "site-packages"):
-    """Give every subprocess sandbox the test libraries (pytest + repo test deps) built by tools/build_testdeps.py.
-
-    In subprocess mode swegemma installs no test deps; each sandbox venv just lists the host's site-packages in a
-    _host_env.pth file. We put the testdeps folder first in that file, so tests see the competition's test wheels
-    (like Kaggle's sandbox image) before anything from the vLLM venv.
-    """
-    testdeps = Path(testdeps)
-    assert (testdeps / "pytest").is_dir(), f"no pytest in {testdeps}: run tools/build_testdeps.py first"
-    from swegemma.sandbox.subprocess import SubprocessManager
-    if getattr(SubprocessManager.start, "_testdeps", False):
-        return
-    orig = SubprocessManager.start
-
-    def start(self, *a, **kw):
-        sid = orig(self, *a, **kw)
-        for sp in self._sandboxes[sid]["venv"].glob("lib/python*/site-packages"):
-            pth = sp / "_host_env.pth"
-            rest = pth.read_text(encoding="utf-8") if pth.exists() else ""
-            pth.write_text(f"{testdeps}\n{rest}", encoding="utf-8")
-        return sid
-
-    start._testdeps = True
-    SubprocessManager.start = start
+def use_testdeps():
+    """Give every subprocess sandbox pytest and this task's test libraries (see tools/testenv.py)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import testenv
+    testenv.install()
 
 
 def pick_tasks(tasks, limit, task_ids, seed):
@@ -146,6 +126,12 @@ def main():
         out = asyncio.run(Evaluator(cfg).run())
         rate = getattr(out, "resolution_rate", None)
         print(f"\nDONE in {(time.time() - t0) / 60:.1f} min: resolution rate {rate} on {len(tasks)} tasks. Details: {results}/summary.json")
+        gold_file = ROOT / "results" / "gold_status.json"
+        if gold_file.exists():  # written by tools/check_gold.py: tasks whose official fix passes on this machine
+            gold = json.loads(gold_file.read_text())
+            res = [r for r in getattr(out, "task_results", []) if gold.get(getattr(r, "instance_id", None))]
+            if res:
+                print(f"on the {len(res)} tasks whose official fix passes locally: {sum(r.resolved for r in res)}/{len(res)} resolved")
     finally:
         server.stop()
 

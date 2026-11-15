@@ -10,7 +10,6 @@ If they fail too, the test environment (subprocess sandbox, wheels, deps) is bro
 import argparse
 import asyncio
 import json
-import os
 import re
 import sys
 import tempfile
@@ -75,7 +74,12 @@ def main():
 
     rs = asyncio.run(run())
     ok = sum(r.resolved for r in rs)
-    print(f"\nfull test logs: {out}/<task>.log")
+    # Remember which tasks the official fix passes here; run_local_eval.py reports scores on those too.
+    status_file = ROOT / "results" / "gold_status.json"
+    status = json.loads(status_file.read_text()) if status_file.exists() else {}
+    status.update({t.instance_id: bool(r.resolved) for t, r in zip(tasks, rs)})
+    status_file.write_text(json.dumps(dict(sorted(status.items())), indent=1))
+    print(f"\nfull test logs: {out}/<task>.log | pass/fail per task saved to {status_file}")
     print(f"OFFICIAL FIX PASSES: {ok}/{len(rs)}  "
           + ("-> test setup works; the 0 score is the model" if ok >= 0.8 * len(rs)
              else "-> test setup is broken on this machine; fix it before trusting any score"))

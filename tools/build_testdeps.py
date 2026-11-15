@@ -18,6 +18,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 ROOT = Path(os.environ.get("GDA_ROOT", Path(__file__).resolve().parents[2] / "gda"))
 BASE = ["pytest", "pytest-timeout==2.1.0"]           # Dockerfile.sandbox installs these from PyPI
 SKIP = {"pytest", "pytest_timeout", "pluggy", "pip", "setuptools", "wheel"}  # provided by BASE / not wanted
@@ -52,20 +53,15 @@ def pick(wheels_dir, py_tag):
     return files, reqs
 
 
-REQ_FILE = re.compile(r"^(requirements|test-requirements|dev-requirements)[\w.-]*\.txt$")
-GROUPS = re.compile(r"^(test|tests|testing|dev|develop|development)$")
-
-
 def repo_test_requirements(data):
     """Each repo's own declared test needs, read from one code snapshot per repo (data/wheels is only a partial set).
 
-    Reads requirements*.txt (following -r includes) and pyproject.toml: runtime deps plus test/dev extras and
-    dependency groups. Skips the repo's own package and editable/local lines.
+    The per-task overlay (tools/testenv.py) later fixes versions that differ between commits of the same repo.
     """
     import tarfile
-    import tomllib
     from swegemma.deduplication import resolve_task_snapshot_paths
     from swegemma.models import load_tasks
+    from testenv import LOCKS, REQ_FILE, declared
     first = {}
     for t in load_tasks(data / "tasks.jsonl"):
         first.setdefault(t.repo, t)
@@ -76,36 +72,9 @@ def repo_test_requirements(data):
         with tarfile.open(snap, "r|gz") as tf:          # stream: read only the small requirement files
             for m in tf:
                 rel = m.name.lstrip("./")
-                if m.isfile() and rel.count("/") <= 1 and (REQ_FILE.match(Path(rel).name) or rel == "pyproject.toml"):
+                if m.isfile() and rel.count("/") <= 1 and (REQ_FILE.match(Path(rel).name) or rel in ("pyproject.toml", *LOCKS)):
                     files[rel] = tf.extractfile(m).read().decode("utf-8", "replace")
-        own = norm(repo.split("/")[-1])
-        out = []
-
-        def from_txt(name, seen):
-            if name in seen or name not in files:
-                return
-            seen.add(name)
-            for line in files[name].splitlines():
-                line = line.split(" #")[0].strip()
-                if line.startswith(("-r ", "--requirement ")):
-                    from_txt(str(Path(name).parent / line.split(None, 1)[1]).lstrip("./"), seen)
-                elif line and not line.startswith(("#", "-", ".", "/", "git+", "http://", "https://")):
-                    out.append(line)
-        seen = set()
-        for name in sorted(files):
-            if name.endswith(".txt") and "docs" not in name:
-                from_txt(name, seen)
-        if "pyproject.toml" in files:
-            try:
-                py = tomllib.loads(files["pyproject.toml"])
-                proj = py.get("project", {})
-                out += proj.get("dependencies", [])
-                for g, deps in {**proj.get("optional-dependencies", {}), **py.get("dependency-groups", {})}.items():
-                    if GROUPS.match(g):
-                        out += [d for d in deps if isinstance(d, str)]
-            except Exception as e:
-                print(f"  {repo}: could not read pyproject.toml ({e})")
-        keep = [d for d in out if not norm(re.split(r"[\s\[<>=!~;]", d, maxsplit=1)[0]).startswith(own)]
+        keep = declared(files, repo)[0]
         print(f"  {repo}: {len(keep)} declared requirements from {', '.join(sorted(files)) or 'nothing'}")
         for d in keep:
             specs.setdefault(d, repo)
