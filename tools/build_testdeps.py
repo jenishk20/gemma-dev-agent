@@ -103,15 +103,33 @@ def main():
         shutil.rmtree(target)
     target.mkdir(parents=True)
 
-    declared = repo_test_requirements(Path(args.wheels).parent)
+    # The base set only needs the right packages; exact versions per task come from the overlay (tools/testenv.py).
+    # So resolve names without version limits: one quick install, no clashes like pytest==8.3.5 vs pytest>=9.
+    from packaging.requirements import InvalidRequirement, Requirement
+    names = {}
+    for d in repo_test_requirements(Path(args.wheels).parent):
+        try:
+            r = Requirement(d)
+        except InvalidRequirement:
+            continue
+        try:
+            if r.marker and not r.marker.evaluate({"extra": ""}):   # e.g. Windows-only or old-Python-only
+                continue
+        except Exception:
+            pass
+        if norm(r.name) not in SKIP:
+            names.setdefault(norm(r.name), r.name + (f"[{','.join(sorted(r.extras))}]" if r.extras else ""))
+    declared = sorted(names.values())
+    print(f"installing pytest + {len(declared)} test libraries: {', '.join(declared)}", flush=True)
     r = uv_install(args.uv, args.python, target, BASE + declared)
     if r.returncode:
-        print(f"could not resolve all declared test requirements together:\n{r.stderr[-1500:]}\ninstalling one by one")
+        print(f"could not install them together:\n{r.stderr[-1500:]}\ninstalling one by one", flush=True)
         if uv_install(args.uv, args.python, target, BASE).returncode:
             sys.exit("pytest install failed")
-        for d in declared:
+        for i, d in enumerate(declared, 1):
+            print(f"  [{i}/{len(declared)}] {d}", flush=True)
             if uv_install(args.uv, args.python, target, [d]).returncode:
-                print(f"  SKIPPED declared requirement: {d}")
+                print(f"  SKIPPED: {d}", flush=True)
     # Test wheels: --no-deps like the harness (it unpacks wheels, it does not resolve them). Batch first, then one by one.
     items, skipped = files + reqs, []
     r = uv_install(args.uv, args.python, target, items, "--no-deps", "--find-links", str(wheels))

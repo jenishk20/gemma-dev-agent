@@ -30,7 +30,14 @@ BASE = ROOT / "testdeps" / "site-packages"
 OVERLAYS = ROOT / "testdeps" / "overlays"
 
 REQ_FILE = re.compile(r"^(requirements|test-requirements|dev-requirements)[\w.-]*\.txt$")
-GROUPS = re.compile(r"^(test|tests|testing|dev|develop|development|all)$")
+TEST_GROUPS = re.compile(r"^(test|tests|testing|all)$")         # pyproject extras / dependency groups we read
+DEV_GROUPS = re.compile(r"^(dev|develop|development)$")          # only if a repo has no test group at all
+SKIP_INCLUDE = re.compile(r"doc|lint|translat|release|github|typing")  # e.g. fastapi's dev -> docs, translations
+# Not needed to run tests (linters, type checkers, browsers), or pytest plugins that change how every test run
+# behaves (random order, parallel workers, fancy output). Kaggle's base set leaves out pytest-xdist the same way.
+SKIP_REQS = {"mypy", "ruff", "ty", "black", "isort", "flake8", "pylint", "pyright", "pre_commit", "prek", "zizmor",
+             "playwright", "pytest_sugar", "pytest_codspeed", "pytest_xdist", "pytest_randomly", "pytest_pretty",
+             "codespell", "tox", "nox", "twine", "build"}
 LOCKS = ("poetry.lock", "uv.lock", "pdm.lock")
 NEVER_PIN = {"pip", "setuptools", "wheel", "pytest_timeout", "python"}  # pytest-timeout stays at Kaggle's 2.1.0
 
@@ -85,15 +92,20 @@ def declared(files, repo=""):
             for d in groups.get(g, []):
                 if isinstance(d, str):
                     out.append(d)
-                elif isinstance(d, dict) and d.get("include-group") and d["include-group"] not in seen:
-                    group(d["include-group"], (*seen, g))
-        for g, deps in proj.get("optional-dependencies", {}).items():
-            if GROUPS.match(g):
+                elif isinstance(d, dict) and (inc := d.get("include-group")) and inc not in seen \
+                        and ("test" in inc or not SKIP_INCLUDE.search(inc)):
+                    group(inc, (*seen, g))
+        extras = proj.get("optional-dependencies", {})
+        has_test = any(TEST_GROUPS.match(g) and g != "all" for g in (*extras, *groups))
+        pick = lambda g: TEST_GROUPS.match(g) or (not has_test and DEV_GROUPS.match(g))  # noqa: E731
+        for g, deps in extras.items():
+            if pick(g):
                 out += [d for d in deps if isinstance(d, str)]
         for g in groups:
-            if GROUPS.match(g):
+            if pick(g):
                 group(g)
-    keep = [d for d in out if norm(re.split(r"[\s\[<>=!~;(]", d, maxsplit=1)[0]) != own]
+    name = lambda d: norm(re.split(r"[\s\[<>=!~;(]", d, maxsplit=1)[0])  # noqa: E731
+    keep = [d for d in out if name(d) != own and name(d) not in SKIP_REQS]
     return list(dict.fromkeys(keep)), direct - {own}, own
 
 
