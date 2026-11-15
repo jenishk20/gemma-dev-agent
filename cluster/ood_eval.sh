@@ -12,6 +12,6 @@
 #SBATCH --output=/scratch/phalle.y/gemma-dev-agent/gda-eval_%j.out
 
 export SUB=submissions/e4b_baseline   # which agent folder to score
-export N=10                           # number of tasks (0 = all 129)
+export N=0                            # number of tasks (0 = all 129)
 export C=8                            # tasks run at the same time
 bash /scratch/phalle.y/gemma-dev-agent/cluster/eval.sbatch
