@@ -41,4 +41,5 @@ if [ ! -d "$GDA_ROOT/testdeps/site-packages/pytest" ]; then
   echo "no test libraries in $GDA_ROOT/testdeps yet: building them now"
   PATH=$GDA_ROOT/bootstrap/bin:$PATH UV_CACHE_DIR=$GDA_ROOT/cache/uv "$GDA_ROOT/venv/bin/python" tools/build_testdeps.py
 fi
-"$GDA_ROOT/venv/bin/python" tools/run_local_eval.py --submission "$SUB" --limit "$N" --concurrency "$C"
+# DATA=$GDA_ROOT/train TASKS=$GDA_ROOT/train/tasks_verified.jsonl: run on the checked practice tasks instead
+"$GDA_ROOT/venv/bin/python" tools/run_local_eval.py --submission "$SUB" --limit "$N" --concurrency "$C" ${DATA:+--data "$DATA"} ${TASKS:+--tasks "$TASKS"}

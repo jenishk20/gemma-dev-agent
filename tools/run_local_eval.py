@@ -55,6 +55,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--submission", required=True, help="submission folder (agent.yaml at its root)")
     ap.add_argument("--data", default=str(ROOT / "data"), help="unpacked competition data")
+    ap.add_argument("--tasks", help="tasks file (default: <data>/tasks.jsonl), e.g. <data>/tasks_verified.jsonl")
     ap.add_argument("--models-dir", default=str(ROOT / "models"), help="contains <model-name>/ weight folders")
     ap.add_argument("--results", default=None)
     ap.add_argument("--limit", type=int, default=10, help="number of tasks (0 = all 129)")
@@ -78,6 +79,7 @@ def main():
     litellm.drop_params = True
     use_testdeps()
     sub, data = Path(args.submission).resolve(), Path(args.data)
+    tasks_file = Path(args.tasks) if args.tasks else data / "tasks.jsonl"
     models = discover_declared_models(sub)
     assert len(models) == 1 and next(iter(models)) in ALLOWED, f"declared models: {sorted(models)}"
     model = next(iter(models))
@@ -102,7 +104,7 @@ def main():
     ), adapter_manifest=adapters)
 
     ev = (yaml.safe_load((sub / "eval_config.yaml").read_text()) or {}).get("evaluation", {}) if (sub / "eval_config.yaml").exists() else {}
-    tasks = pick_tasks(load_tasks(data / "tasks.jsonl"), args.limit, args.task_ids, args.seed)
+    tasks = pick_tasks(load_tasks(tasks_file), args.limit, args.task_ids, args.seed)
     results = Path(args.results or (ROOT / "results" / f"{sub.name}_{time.strftime('%m%d-%H%M')}"))
     results.mkdir(parents=True, exist_ok=True)
     (results / "run_args.json").write_text(json.dumps({**vars(args), "model": model, "eval_config": ev,
@@ -114,7 +116,7 @@ def main():
         registry = server.create_model_registry(aliases=[model], model_prefix="openai/", api_key="EMPTY")
         limits, gen = build_submission_limits()
         cfg = EvalConfig(
-            tasks_path=data / "tasks.jsonl", snapshots_dir=data / "snapshots", results_dir=results,
+            tasks_path=tasks_file, snapshots_dir=data / "snapshots", results_dir=results,
             submission_dir=sub, models=registry, sandbox="subprocess",
             timeout_seconds=int(ev.get("timeout_seconds", 300)),
             verification_timeout_seconds=int(ev.get("verification_timeout_seconds", 300)),
