@@ -42,7 +42,10 @@ SKIP_REQS = {"mypy", "ruff", "ty", "black", "isort", "flake8", "pylint", "pyrigh
              "playwright", "pytest_sugar", "pytest_codspeed", "pytest_xdist", "pytest_randomly", "pytest_pretty",
              "codespell", "tox", "nox", "twine", "build"}
 LOCKS = ("poetry.lock", "uv.lock", "pdm.lock")
-NEVER_PIN = {"pip", "setuptools", "wheel", "pytest_timeout", "python"}  # pytest-timeout stays at Kaggle's 2.1.0
+NEVER_PIN = {"pip", "setuptools", "wheel", "pytest_timeout", "python",  # pytest-timeout stays at Kaggle's 2.1.0
+             "typing_extensions"}  # old pins break base plugins (inline-snapshot needs typing_extensions.deprecated)
+# pytest itself is never taken below 8: the base set's plugins import pytest-8 internals (_pytest._io.pprint).
+PYTEST_FLOOR = ("8.0.0", "8.1.1", "8.2.2", "8.3.5", "8.4.2")
 
 
 def norm(name):
@@ -54,7 +57,7 @@ def read_repo_files(ws):
     ws, files = Path(ws), {}
     for p in [*ws.glob("*"), *ws.glob("*/*")]:
         rel = p.relative_to(ws).as_posix()
-        if p.is_file() and (REQ_FILE.match(p.name) or rel in ("pyproject.toml", *LOCKS)):
+        if p.is_file() and (REQ_FILE.match(p.name) or rel in ("pyproject.toml", "setup.py", "setup.cfg", *LOCKS)):
             files[rel] = p.read_text(encoding="utf-8", errors="replace")
     return files
 
@@ -108,9 +111,78 @@ def declared(files, repo=""):
         for g in groups:
             if pick(g):
                 group(g)
+    if "pyproject.toml" in files:                        # old flit layout (e.g. fastapi before 2023)
+        flit = py.get("tool", {}).get("flit", {}).get("metadata", {})
+        if flit:
+            own = norm(flit.get("dist-name") or flit.get("module") or own)
+            deps = [d for d in flit.get("requires", []) if isinstance(d, str)]
+            out += deps
+            direct |= {norm(re.split(r"[\s\[<>=!~;(]", d, maxsplit=1)[0]) for d in deps}
+            fx = flit.get("requires-extra", {})
+            fx_test = any(TEST_GROUPS.match(g) and g != "all" for g in fx)
+            for g, deps in fx.items():
+                if TEST_GROUPS.match(g) or (not fx_test and DEV_GROUPS.match(g)):
+                    out += [d for d in deps if isinstance(d, str)]
+    for inst, extras in (setup_py(files.get("setup.py", "")), setup_cfg(files.get("setup.cfg", ""))):
+        out += inst
+        direct |= {norm(re.split(r"[\s\[<>=!~;(]", d, maxsplit=1)[0]) for d in inst}
+        ex_test = any(TEST_GROUPS.match(g) and g != "all" for g in extras)
+        for g, deps in extras.items():
+            if TEST_GROUPS.match(g) or (not ex_test and DEV_GROUPS.match(g)):
+                out += deps
     name = lambda d: norm(re.split(r"[\s\[<>=!~;(]", d, maxsplit=1)[0])  # noqa: E731
-    keep = [d for d in out if name(d) != own and name(d) not in SKIP_REQS]
+    keep = [d for d in out if name(d) != own and name(d) not in SKIP_REQS and not name(d).startswith("flake8")]
     return list(dict.fromkeys(keep)), direct - {own}, own
+
+
+def setup_py(text):
+    """(install_requires, {extra: requires}) from a setup.py, when they are written as plain lists of strings."""
+    import ast
+    if not text:
+        return [], {}
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return [], {}
+    names = {}
+    for node in tree.body:                               # e.g. requires = [...]; setup(install_requires=requires)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            names[node.targets[0].id] = node.value
+
+    def strs(v):
+        v = names.get(v.id, v) if isinstance(v, ast.Name) else v
+        if isinstance(v, (ast.List, ast.Tuple)):
+            return [e.value for e in v.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        return []
+    inst, extras = [], {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", "")) == "setup":
+            for kw in node.keywords:
+                if kw.arg in ("install_requires", "tests_require"):
+                    inst += strs(kw.value)
+                elif kw.arg == "extras_require":
+                    v = names.get(kw.value.id, kw.value) if isinstance(kw.value, ast.Name) else kw.value
+                    if isinstance(v, ast.Dict):
+                        for k, val in zip(v.keys, v.values):
+                            if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                                extras[k.value] = strs(val)
+    return inst, extras
+
+
+def setup_cfg(text):
+    """(install_requires, {extra: requires}) from a setup.cfg."""
+    import configparser
+    if not text:
+        return [], {}
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        cp.read_string(text)
+    except Exception:
+        return [], {}
+    lines = lambda v: [x.split(" #")[0].strip() for x in v.splitlines() if x.strip() and not x.strip().startswith("#")]  # noqa: E731
+    inst = lines(cp.get("options", "install_requires", fallback="")) + lines(cp.get("options", "tests_require", fallback=""))
+    extras = {k: lines(v) for k, v in cp["options.extras_require"].items()} if cp.has_section("options.extras_require") else {}
+    return inst, extras
 
 
 def lock_versions(files):
@@ -156,6 +228,12 @@ def task_pins(files, repo="", base=None):
         except Exception:
             pass
         have = base.get(n)
+        if n == "pytest":                                # keep pytest >= 8 (see PYTEST_FLOOR); else use the base one
+            if r.specifier and have and not r.specifier.contains(Version(have), prereleases=True):
+                ok8 = [v for v in PYTEST_FLOOR if r.specifier.contains(Version(v))]
+                if ok8:
+                    pins[n] = f"pytest{r.specifier},>=8"
+            continue
         if n in direct and n in lock and have != lock[n]:
             pins[n] = f"{r.name}=={lock[n]}"
         elif have is None:
@@ -265,8 +343,8 @@ def install():
         except Exception as e:                               # never break a run over this; base set still works
             print(f"  [testenv] {repo}: overlay failed ({e}); using the base set", flush=True)
             overlay = None
-        src = ws / "src"
-        first = [p for p in (src if src.is_dir() else None, overlay) if p]
+        src, docs_src = ws / "src", ws / "docs" / "src"      # docs/src: old fastapi's tutorial apps
+        first = [p for p in (src if src.is_dir() else None, docs_src if docs_src.is_dir() else None, overlay) if p]
         write_path(docker, container_id, first)
     for m in (cs_mod, h_mod, ar_mod, vf_mod, ev_mod):
         if hasattr(m, "install_test_dependencies"):
