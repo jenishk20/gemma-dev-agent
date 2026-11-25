@@ -43,6 +43,64 @@ def use_testdeps():
     testenv.install()
 
 
+# Teacher mode: the agent runs on a hosted model (W&B Inference) instead of a local vLLM, e.g. to collect
+# training runs from a stronger model. USD per million tokens (input, output, cached input), from W&B's price list
+# (coreweave.com/forge-pricing/inference-agents, read 2026-11-25).
+TEACHER_PRICES = {
+    "moonshotai/Kimi-K2.7-Code": (0.60, 3.00, 0.12),
+    "deepseek-ai/DeepSeek-V4-Pro-0813": (1.31, 3.96, 0.044),
+    "zai-org/GLM-5.3": (0.75, 3.00, 0.19),
+    "deepseek-ai/DeepSeek-V4.1-Flash": (0.13, 0.65, 0.002),
+    "google/gemma-4-31B-it": (0.10, 0.34, 0.10),
+}
+
+
+class BudgetGuard:
+    """Counts the dollars spent on hosted-model calls and refuses every call once the budget is used up."""
+
+    def __init__(self, model, budget_usd, log_file):
+        assert model in TEACHER_PRICES, f"no price for {model}; add it to TEACHER_PRICES first"
+        self.price, self.budget, self.log_file = TEACHER_PRICES[model], budget_usd, log_file
+        self.spent, self.calls, self.tokens_in, self.tokens_cached, self.tokens_out, self.next_print = 0.0, 0, 0, 0, 0, 0.5
+
+    def add(self, usage):
+        if usage is None:
+            return
+        get = (lambda o, k: o.get(k) if isinstance(o, dict) else getattr(o, k, None))
+        tin, tout = get(usage, "prompt_tokens") or 0, get(usage, "completion_tokens") or 0
+        det = get(usage, "prompt_tokens_details")
+        cached = (get(det, "cached_tokens") or 0) if det is not None else 0
+        pin, pout, pcache = self.price
+        self.spent += ((tin - cached) * pin + cached * pcache + tout * pout) / 1e6
+        self.calls += 1
+        self.tokens_in, self.tokens_cached, self.tokens_out = self.tokens_in + tin, self.tokens_cached + cached, self.tokens_out + tout
+        self.log_file.write_text(json.dumps({"usd": round(self.spent, 4), "budget_usd": self.budget, "calls": self.calls,
+                                             "tokens_in": self.tokens_in, "tokens_cached": self.tokens_cached,
+                                             "tokens_out": self.tokens_out}, indent=1))
+        if self.spent >= self.next_print:
+            print(f"  [teacher] spent ${self.spent:.2f} of ${self.budget:.2f} ({self.calls} calls)", flush=True)
+            self.next_print += 0.5
+
+    def install(self):
+        import google.adk.models.lite_llm as lm
+        lm._ensure_litellm_imported()                      # ADK imports litellm lazily and would overwrite our wrapper
+        orig, guard = lm.acompletion, self
+
+        async def acompletion(*a, **kw):
+            if guard.spent >= guard.budget:
+                raise RuntimeError(f"teacher budget of ${guard.budget:.2f} reached; no more model calls")
+            res = await orig(*a, **kw)
+            if hasattr(res, "__aiter__"):                  # streaming: usage arrives on the last chunk
+                async def counted():
+                    async for chunk in res:
+                        guard.add(getattr(chunk, "usage", None))
+                        yield chunk
+                return counted()
+            guard.add(getattr(res, "usage", None))
+            return res
+        lm.acompletion = acompletion
+
+
 def pick_tasks(tasks, limit, task_ids, seed):
     if task_ids:
         return [t for t in tasks if t.instance_id in set(task_ids)]
@@ -64,6 +122,9 @@ def main():
     ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--gpu-mem", type=float, default=0.90)
     ap.add_argument("--port", type=int, default=0, help="vLLM port (0 = any free one, so two jobs on one node never clash)")
+    ap.add_argument("--teacher", help="run the agent on this hosted model instead of local weights, e.g. moonshotai/Kimi-K2.7-Code")
+    ap.add_argument("--teacher-base", default="https://api.inference.wandb.ai/v1")
+    ap.add_argument("--budget-usd", type=float, default=5.0, help="teacher mode: hard stop on hosted-model spending")
     args = ap.parse_args()
 
     import litellm
@@ -84,12 +145,12 @@ def main():
     assert len(models) == 1 and next(iter(models)) in ALLOWED, f"declared models: {sorted(models)}"
     model = next(iter(models))
     model_path = Path(args.models_dir) / model
-    assert (model_path / "config.json").exists(), f"weights not found in {model_path} (run cluster/setup.sh)"
+    assert args.teacher or (model_path / "config.json").exists(), f"weights not found in {model_path} (run cluster/setup.sh)"
 
     adapters = discover_adapters(str(sub), adapter_extensions=ALLOWED_ADAPTER_EXTENSIONS)
     amap = getattr(adapters, "adapters", None) or {}
     ranks = [r for i in amap.values() if (r := getattr(i, "rank", None))]
-    gpus = torch.cuda.device_count()
+    gpus = torch.cuda.device_count() if not args.teacher else 0
     if not args.port:
         import socket
         with socket.socket() as sk:
@@ -111,9 +172,23 @@ def main():
                                                        "task_ids": [t.instance_id for t in tasks]}, indent=1))
     print(f"model={model} gpus={gpus} port={args.port} tasks={len(tasks)} concurrency={args.concurrency} budgets={ev} -> {results}", flush=True)
 
+    if args.teacher:                                       # hosted model: no local server, a hard spending cap
+        from adk_submission.registry import ModelRegistry
+        from adk_submission.resolvers.generation import install_litellm_reasoning_patch
+        from google.adk.models.lite_llm import LiteLlm
+        key = os.environ.get("WANDB_API_KEY")
+        assert key, "teacher mode needs WANDB_API_KEY in the environment"
+        guard = BudgetGuard(args.teacher, args.budget_usd, results / "teacher_spend.json")
+        guard.install()
+        install_litellm_reasoning_patch()
+        registry = ModelRegistry()
+        registry.register(model, LiteLlm(model=f"openai/{args.teacher}", api_base=args.teacher_base, api_key=key))
+        print(f"teacher mode: {args.teacher} via {args.teacher_base}, budget ${args.budget_usd:.2f}", flush=True)
+        server.start = server.stop = lambda *a, **k: None
     server.start()
     try:
-        registry = server.create_model_registry(aliases=[model], model_prefix="openai/", api_key="EMPTY")
+        if not args.teacher:
+            registry = server.create_model_registry(aliases=[model], model_prefix="openai/", api_key="EMPTY")
         limits, gen = build_submission_limits()
         cfg = EvalConfig(
             tasks_path=tasks_file, snapshots_dir=data / "snapshots", results_dir=results,
