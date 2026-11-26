@@ -62,6 +62,7 @@ class BudgetGuard:
         assert model in TEACHER_PRICES, f"no price for {model}; add it to TEACHER_PRICES first"
         self.price, self.budget, self.log_file = TEACHER_PRICES[model], budget_usd, log_file
         self.spent, self.calls, self.tokens_in, self.tokens_cached, self.tokens_out, self.next_print = 0.0, 0, 0, 0, 0, 0.5
+        self.failures = 0
 
     def add(self, usage):
         if usage is None:
@@ -76,7 +77,7 @@ class BudgetGuard:
         self.tokens_in, self.tokens_cached, self.tokens_out = self.tokens_in + tin, self.tokens_cached + cached, self.tokens_out + tout
         self.log_file.write_text(json.dumps({"usd": round(self.spent, 4), "budget_usd": self.budget, "calls": self.calls,
                                              "tokens_in": self.tokens_in, "tokens_cached": self.tokens_cached,
-                                             "tokens_out": self.tokens_out}, indent=1))
+                                             "tokens_out": self.tokens_out, "failed_calls": self.failures}, indent=1))
         if self.spent >= self.next_print:
             print(f"  [teacher] spent ${self.spent:.2f} of ${self.budget:.2f} ({self.calls} calls)", flush=True)
             self.next_print += 0.5
@@ -86,10 +87,29 @@ class BudgetGuard:
         lm._ensure_litellm_imported()                      # ADK imports litellm lazily and would overwrite our wrapper
         orig, guard = lm.acompletion, self
 
+        def one_reasoning_field(messages):
+            # adk_submission's reasoning patch copies past thoughts into both `reasoning_content` and `reasoning`.
+            # vLLM accepts that; W&B Inference rejects it ("duplicate field `reasoning_content`"), which ended
+            # every task right after its first tool call. Keep `reasoning_content` only.
+            for m in messages or []:
+                get = m.get if hasattr(m, "get") else (lambda k, d=None, m=m: getattr(m, k, d))
+                if get("reasoning_content") is not None and get("reasoning") is not None:
+                    if isinstance(m, dict):
+                        m.pop("reasoning", None)
+                    else:
+                        setattr(m, "reasoning", None)
+
         async def acompletion(*a, **kw):
             if guard.spent >= guard.budget:
                 raise RuntimeError(f"teacher budget of ${guard.budget:.2f} reached; no more model calls")
-            res = await orig(*a, **kw)
+            one_reasoning_field(kw.get("messages"))
+            try:
+                res = await orig(*a, **kw)
+            except Exception as e:                         # make failed calls visible in the job log
+                guard.failures += 1
+                if guard.failures <= 5:
+                    print(f"  [teacher] model call failed ({guard.failures}): {str(e)[:300]}", flush=True)
+                raise
             if hasattr(res, "__aiter__"):                  # streaming: usage arrives on the last chunk
                 async def counted():
                     async for chunk in res:
