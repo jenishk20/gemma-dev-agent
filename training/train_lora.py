@@ -162,6 +162,7 @@ def main():
     model.print_trainable_parameters()
     names = [n for n, p in model.named_parameters() if p.requires_grad]
     print("first LoRA weights:", names[:4], flush=True)
+    model.train()                                              # gradient checkpointing only runs in train mode
     if args.check_load:                                        # one real loss + backward on the longest example
         d = max(data, key=lambda d: len(d["input_ids"]))
         ids, lab = torch.tensor([d["input_ids"]], device="cuda"), torch.tensor(d["labels"], device="cuda")
