@@ -23,7 +23,8 @@ BUDGET=${BUDGET:-10}                            # USD per try; every model call 
 
 REPO=/scratch/phalle.y/gemma-dev-agent
 cd "$REPO"
-git pull -q || echo "git pull failed; using the code already on disk"
+# Parallel tries share this checkout: take turns on the update (two pulls at once fail on git's lock).
+flock /scratch/phalle.y/gda/.gitlock git pull -q || echo "git pull failed; using the code already on disk"
 export GDA_ROOT=$(dirname "$REPO")/gda
 export XDG_CACHE_HOME=$GDA_ROOT/cache UV_CACHE_DIR=$GDA_ROOT/cache/uv PYTHONUNBUFFERED=1 HF_HOME=$GDA_ROOT/cache/hf
 PY=$GDA_ROOT/venv/bin/python
