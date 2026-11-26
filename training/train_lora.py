@@ -117,6 +117,7 @@ def main():
     ap.add_argument("--accum", type=int, default=8, help="conversations per optimizer step")
     ap.add_argument("--max-len", type=int, default=32768)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--weight-decay", type=float, default=0.01)
     args = ap.parse_args()
 
     tok = load_tokenizer(args.model)
@@ -177,9 +178,10 @@ def main():
         return
 
     params = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0, betas=(0.9, 0.99))
+    # gemma.ai/tuning/best-practices: LoRA SFT weight decay 0.01, warmup 3-5%, cosine, grad norm 1.0
+    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99))
     total = max(1, math.ceil(len(data) * args.epochs / args.accum))
-    warm = max(1, total // 10)
+    warm = max(1, round(total * 0.05))
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: (s + 1) / warm if s < warm else 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, total - warm))))
     order = []
