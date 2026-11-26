@@ -7,8 +7,11 @@ The last call of a run holds the whole conversation exactly as the model saw it,
 that call's messages + its reply. If context compaction rewrote the history mid-run, the run has several
 "final" calls (each one not continued by a later call); each becomes its own example.
 
-Only the main agent's calls are used (the ones whose task message contains the problem statement);
-sub-agent calls (code_analyzer) are skipped for now.
+Only the main agent's calls are used; sub-agent (code_analyzer) and compaction-summary calls are skipped.
+A main-agent call is matched to its task by the problem statement in its task message. After compaction
+the task message is gone (the history starts with "For context: [model] said: <summary>"), so those calls
+are matched by the model's own earlier messages they still carry (compaction keeps the last few events):
+an assistant message, with its thinking text, belongs to exactly one conversation.
 
 Only training tasks are allowed in: any task from the "test" side of training/public_split.json stops the build.
 
@@ -57,6 +60,43 @@ def task_of(messages, statements):
     return hits[0] if len(hits) == 1 else None
 
 
+def asst_keys(c):
+    """Keys of the model's own messages in a call (history + reply); thinking text makes them unique."""
+    out = set()
+    for m in c["messages"] + [c["reply"]]:
+        if m.get("role", "assistant") == "assistant" and (m.get("reasoning_content") or m.get("reasoning")):
+            out.add(json.dumps([m.get("reasoning_content") or m.get("reasoning"), m.get("content") or "",
+                                [tc.get("function") for tc in m.get("tool_calls") or []]], sort_keys=True))
+    return out
+
+
+def match_calls(calls, statements):
+    """{call index: instance_id} for main-agent calls, including the ones after compaction."""
+    match = {i: iid for i, c in enumerate(calls) if (iid := task_of(c["messages"], statements))}
+    systems = Counter(json.dumps(calls[i]["messages"][0]) for i in match if calls[i]["messages"])
+    main_system = systems.most_common(1)[0][0] if systems else None
+    owner = defaultdict(set)                              # message key -> tasks it was seen in
+    for i, iid in match.items():
+        for k in asst_keys(calls[i]):
+            owner[k].add(iid)
+    todo = [i for i, c in enumerate(calls)
+            if i not in match and c["messages"] and json.dumps(c["messages"][0]) == main_system]
+    changed = True
+    while changed:                                        # repeat: a run can be compacted more than once
+        changed = False
+        for i in list(todo):
+            ks = asst_keys(calls[i])
+            hits = {t for k in ks for t in owner.get(k, ())}
+            if len(hits) == 1:
+                iid = hits.pop()
+                match[i] = iid
+                for k in ks:
+                    owner[k].add(iid)
+                todo.remove(i)
+                changed = True
+    return match, len(todo)
+
+
 def final_calls(calls):
     """Calls whose conversation no later call continues (normally just the last one)."""
     keys = [[json.dumps(m, sort_keys=True, default=str) for m in c["messages"]] for c in calls]
@@ -91,12 +131,14 @@ def main():
         results = [json.loads(l) for l in open(results_file) if l.strip()]
         solved = {r["instance_id"] for r in results if r.get("resolved")}
         by_task = defaultdict(list)
-        for c in read_calls(calls_file):
-            iid = task_of(c["messages"], statements)
-            if iid is None:
-                stats["sub-agent or unmatched calls"] += 1
-                continue
-            by_task[iid].append(c)
+        calls = read_calls(calls_file)
+        match, unmatched_main = match_calls(calls, statements)
+        for i, c in enumerate(calls):
+            if i in match:
+                by_task[match[i]].append(c)
+        stats["main-agent calls matched"] += len(match)
+        stats["main-agent calls NOT matched"] += unmatched_main
+        stats["sub-agent / summary calls (skipped)"] += len(calls) - len(match) - unmatched_main
         stats["solved runs"] += len(solved)
         for iid in sorted(solved):
             if iid in test_ids:
@@ -110,6 +152,8 @@ def main():
                 examples.append({"instance_id": iid, "run": run.name, "repo": tasks[iid]["repo"],
                                  "n_calls": len(calls), "messages": msgs, "tools": c.get("tools") or []})
             stats["solved runs used"] += 1
+            if any(tc["function"]["name"] == "submit_patch" for c in calls for tc in c["reply"].get("tool_calls") or []):
+                stats["solved runs whose data includes submit_patch"] += 1
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
