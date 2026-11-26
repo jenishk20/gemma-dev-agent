@@ -1,10 +1,11 @@
 #!/bin/bash
-# Paste into OOD Job Composer: trained E4B vs plain E4B on the 29 held-out test tasks (never used in training),
-# each twice, because one run moves by a few tasks either way. 4 parallel jobs (--array=1-4), 1 H200 each:
-#   1, 2 = submissions/e4b_tprompt (no adapter)   3, 4 = submissions/e4b_lora_v1 + the trained adapter
-# Both use the exact prompt, tools and agent name of the Kimi teacher runs; the only difference is the adapter.
+# Paste into OOD Job Composer: a model with a trained adapter vs the same model without, on the 29 held-out
+# test tasks (never used in training), each twice, because one run moves by a few tasks either way.
+# 4 parallel jobs (--array=1-4), 1 H200 each:  1, 2 = BASE (no adapter)   3, 4 = LORA + ADAPTER
+#   BASE / LORA: submission folders that differ only by `adapter: main_lora` (defaults: the E4B Kimi pair)
+#   ADAPTER: a folder from cluster/ood_train_lora.sh (default: the newest $GDA_ROOT/adapters/$ADAPTER_NAME_*)
+#   e.g. BASE=submissions/e4b_v4 LORA=submissions/e4b_v4_lora ADAPTER_NAME=e4b_self_v1
 # This is also the test that vLLM loads our LoRA on the W4A16 QAT model, the way Kaggle's scorer does.
-# ADAPTER: folder from cluster/ood_train_lora.sh (default: the newest $GDA_ROOT/adapters/e4b_teacher_v1_*).
 # Logs: /scratch/phalle.y/gemma-dev-agent/gda-evlora_<jobid>_<n>.out ; results: $GDA_ROOT/results/evlora_<jobid>_<n>_<name>/
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
@@ -22,7 +23,10 @@ cd "$REPO"
 GDA_ROOT=$(dirname "$REPO")/gda
 I=${SLURM_ARRAY_TASK_ID:-3}
 JOB=${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}
-ADAPTER=${ADAPTER:-$(ls -td "$GDA_ROOT"/adapters/e4b_teacher_v1_* 2>/dev/null | head -1)}
+BASE=${BASE:-submissions/e4b_tprompt}
+LORA=${LORA:-submissions/e4b_lora_v1}
+ADAPTER_NAME=${ADAPTER_NAME:-e4b_teacher_v1}
+ADAPTER=${ADAPTER:-$(ls -td "$GDA_ROOT"/adapters/${ADAPTER_NAME}_* 2>/dev/null | head -1)}
 
 TASKS=$GDA_ROOT/data/tasks_test29.jsonl
 [ -s "$TASKS" ] || "$GDA_ROOT/venv/bin/python" - "$GDA_ROOT/data/tasks.jsonl" "$TASKS" <<'PY'
@@ -34,12 +38,12 @@ open(sys.argv[2], "w").write("".join(rows))
 PY
 
 if [ "$I" -le 2 ]; then
-  NAME=e4b_tprompt; SUBDIR=$REPO/submissions/e4b_tprompt
+  NAME=$(basename "$BASE"); SUBDIR=$REPO/$BASE
 else
-  NAME=e4b_lora_v1
+  NAME=$(basename "$LORA")
   [ -s "$ADAPTER/adapter_model.safetensors" ] || { echo "ERROR: no trained adapter found ($ADAPTER)"; exit 1; }
   SUBDIR=$GDA_ROOT/subs/${NAME}_${JOB}_$I             # private copy with the adapter inside, as in the Kaggle zip
-  rm -rf "$SUBDIR"; mkdir -p "$(dirname "$SUBDIR")"; cp -r "$REPO/submissions/$NAME" "$SUBDIR"
+  rm -rf "$SUBDIR"; mkdir -p "$(dirname "$SUBDIR")"; cp -r "$REPO/$LORA" "$SUBDIR"
   mkdir -p "$SUBDIR/adapters/main_lora"
   cp "$ADAPTER/adapter_config.json" "$ADAPTER/adapter_model.safetensors" "$SUBDIR/adapters/main_lora/"
   echo "adapter: $ADAPTER ($(du -sh "$ADAPTER/adapter_model.safetensors" | cut -f1))"

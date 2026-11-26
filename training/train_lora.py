@@ -21,7 +21,10 @@ import time
 from copy import deepcopy
 from pathlib import Path
 
-TARGETS = r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+# Text decoder only (never the vision/audio towers), for both multimodal (…language_model.layers…) and
+# text-only (model.layers…) checkpoints. PEFT full-matches this against module names.
+PROJ = r"(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+TARGETS = rf"(.*\.language_model\..*\.{PROJ}|model\.layers\.\d+\..*\.{PROJ})"
 
 
 def for_template(messages):

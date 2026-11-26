@@ -56,11 +56,15 @@ TEACHER_PRICES = {
 
 
 class BudgetGuard:
-    """Counts the dollars spent on hosted-model calls and refuses every call once the budget is used up."""
+    """Counts the dollars spent on hosted-model calls and refuses every call once the budget is used up.
+    model=None: record-only (local vLLM runs, --record-calls): no price, no budget, messages sent unchanged."""
 
     def __init__(self, model, budget_usd, log_file, calls_file=None):
-        assert model in TEACHER_PRICES, f"no price for {model}; add it to TEACHER_PRICES first"
-        self.price, self.budget, self.log_file = TEACHER_PRICES[model], budget_usd, log_file
+        assert model is None or model in TEACHER_PRICES, f"no price for {model}; add it to TEACHER_PRICES first"
+        self.price = TEACHER_PRICES[model] if model else (0.0, 0.0, 0.0)
+        self.budget = budget_usd if model else float("inf")
+        self.strip_reasoning = model is not None            # only W&B rejects the duplicate thought field
+        self.log_file = log_file
         self.spent, self.calls, self.tokens_in, self.tokens_cached, self.tokens_out, self.next_print = 0.0, 0, 0, 0, 0, 0.5
         self.failures = 0
         # Every successful call's exact request (messages + tools) and reply, for building training examples:
@@ -127,7 +131,8 @@ class BudgetGuard:
         async def acompletion(*a, **kw):
             if guard.spent >= guard.budget:
                 raise RuntimeError(f"teacher budget of ${guard.budget:.2f} reached; no more model calls")
-            one_reasoning_field(kw.get("messages"))
+            if guard.strip_reasoning:
+                one_reasoning_field(kw.get("messages"))
             try:
                 res = await orig(*a, **kw)
             except Exception as e:                         # make failed calls visible in the job log
@@ -171,6 +176,9 @@ def main():
     ap.add_argument("--teacher", help="run the agent on this hosted model instead of local weights, e.g. moonshotai/Kimi-K2.7-Code")
     ap.add_argument("--teacher-base", default="https://api.inference.wandb.ai/v1")
     ap.add_argument("--budget-usd", type=float, default=5.0, help="teacher mode: hard stop on hosted-model spending")
+    ap.add_argument("--record-calls", action="store_true",
+                    help="local runs: save every model call's exact request and reply (model_calls.jsonl.gz), "
+                         "for self-distillation (training/build_sft.py)")
     args = ap.parse_args()
 
     import litellm
@@ -235,6 +243,9 @@ def main():
     try:
         if not args.teacher:
             registry = server.create_model_registry(aliases=[model], model_prefix="openai/", api_key="EMPTY")
+            if args.record_calls:
+                BudgetGuard(None, 0, results / "call_stats.json", results / "model_calls.jsonl.gz").install()
+                print("recording every model call -> model_calls.jsonl.gz", flush=True)
         limits, gen = build_submission_limits()
         cfg = EvalConfig(
             tasks_path=tasks_file, snapshots_dir=data / "snapshots", results_dir=results,

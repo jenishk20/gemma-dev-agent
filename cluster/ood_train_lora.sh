@@ -1,6 +1,11 @@
 #!/bin/bash
-# Paste into OOD Job Composer: fine-tune a LoRA for E4B on the solved teacher runs (1 x H200).
-# Steps: build examples from results/teacher_*_try* -> print one rendered example -> check model + LoRA load
+# Paste into OOD Job Composer: fine-tune a LoRA on solved runs (1 x H200).
+#   Kimi runs -> E4B (default):  RUNS='teacher_*_try*'  MODEL=gemma-4-e4b-it-qat-w4a16-ct  NAME=e4b_teacher_v1
+#   E4B's own runs:              RUNS='self_e4b_v4_*'   NAME=e4b_self_v1
+#   31B's own runs:              RUNS='self_31b_v2_gen_*' MODEL=gemma-4-31b-it-qat-w4a16-ct NAME=31b_self_v1
+#   Kimi runs -> 31B:            RUNS='teacher_*_try*'  MODEL=gemma-4-31b-it-qat-w4a16-ct NAME=31b_teacher_v1
+# (RUNS is a folder pattern under $GDA_ROOT/results/.)
+# Steps: build examples from those runs -> print one rendered example -> check model + LoRA load
 # and one loss/backward on the longest example -> train -> save adapter.
 # Everything stays under /scratch/phalle.y/gda. peft goes into its own folder ($GDA_ROOT/pylib), so the
 # eval venv (vLLM) is not changed.
@@ -18,6 +23,7 @@ trap 'echo "FAILED: line $LINENO exited with code $? at $(date +%T)"' ERR
 
 MODEL=${MODEL:-gemma-4-e4b-it-qat-w4a16-ct}
 NAME=${NAME:-e4b_teacher_v1}
+RUNS=${RUNS:-teacher_*_try*}
 RANK=${RANK:-32}
 EPOCHS=${EPOCHS:-2}
 LR=${LR:-1e-4}
@@ -30,7 +36,7 @@ export GDA_ROOT=$(dirname "$REPO")/gda
 export XDG_CACHE_HOME=$GDA_ROOT/cache UV_CACHE_DIR=$GDA_ROOT/cache/uv PYTHONUNBUFFERED=1 HF_HOME=$GDA_ROOT/cache/hf \
        TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=$GDA_ROOT/venv/bin/python
-echo "job $SLURM_JOB_ID on $(hostname) | commit $(git rev-parse --short HEAD) | $MODEL rank=$RANK epochs=$EPOCHS lr=$LR | $(date)"
+echo "job $SLURM_JOB_ID on $(hostname) | commit $(git rev-parse --short HEAD) | $NAME from $RUNS | $MODEL rank=$RANK epochs=$EPOCHS lr=$LR | $(date)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 # peft only (its other needs are already in the venv), in a separate folder
@@ -41,7 +47,7 @@ export PYTHONPATH=$GDA_ROOT/pylib
 "$PY" -c "import peft, transformers, torch; print('peft', peft.__version__, '| transformers', transformers.__version__, '| torch', torch.__version__)"
 
 DATA=$GDA_ROOT/data/sft/${NAME}.jsonl
-"$PY" training/build_sft.py --runs $(ls -d "$GDA_ROOT"/results/teacher_*_try*) --tasks "$GDA_ROOT/data/tasks.jsonl" --out "$DATA"
+"$PY" training/build_sft.py --runs $(ls -d "$GDA_ROOT"/results/$RUNS) --tasks "$GDA_ROOT/data/tasks.jsonl" --out "$DATA"
 "$PY" training/train_lora.py --data "$DATA" --model "$GDA_ROOT/models/$MODEL" --show 1
 "$PY" training/train_lora.py --data "$DATA" --model "$GDA_ROOT/models/$MODEL" --rank "$RANK" --check-load
 [ "$ONLY_CHECK" = 1 ] && { echo "check only: done $(date)"; exit 0; }
