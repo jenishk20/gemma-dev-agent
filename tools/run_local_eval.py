@@ -58,11 +58,14 @@ TEACHER_PRICES = {
 class BudgetGuard:
     """Counts the dollars spent on hosted-model calls and refuses every call once the budget is used up."""
 
-    def __init__(self, model, budget_usd, log_file):
+    def __init__(self, model, budget_usd, log_file, calls_file=None):
         assert model in TEACHER_PRICES, f"no price for {model}; add it to TEACHER_PRICES first"
         self.price, self.budget, self.log_file = TEACHER_PRICES[model], budget_usd, log_file
         self.spent, self.calls, self.tokens_in, self.tokens_cached, self.tokens_out, self.next_print = 0.0, 0, 0, 0, 0, 0.5
         self.failures = 0
+        # Every successful call's exact request (messages + tools) and reply, for building training examples:
+        # the last call of a solved run holds the whole conversation exactly as the model saw it.
+        self.calls_file = calls_file
 
     def add(self, usage):
         if usage is None:
@@ -81,6 +84,28 @@ class BudgetGuard:
         if self.spent >= self.next_print:
             print(f"  [teacher] spent ${self.spent:.2f} of ${self.budget:.2f} ({self.calls} calls)", flush=True)
             self.next_print += 0.5
+
+    def record(self, kw, res):
+        if self.calls_file is None:
+            return
+        import gzip
+
+        def plain(o):
+            if hasattr(o, "model_dump"):
+                return o.model_dump(exclude_none=True)
+            if isinstance(o, dict):
+                return {k: plain(v) for k, v in o.items()}
+            if isinstance(o, (list, tuple)):
+                return [plain(v) for v in o]
+            return o
+        try:
+            row = {"t": time.time(), "messages": plain(kw.get("messages")), "tools": plain(kw.get("tools")),
+                   "reply": plain(res.choices[0].message), "finish_reason": res.choices[0].finish_reason,
+                   "usage": plain(getattr(res, "usage", None))}
+            with gzip.open(self.calls_file, "at") as f:          # one gzip member per line; readable as one stream
+                f.write(json.dumps(row, default=str) + "\n")
+        except Exception as e:                                  # never let logging break a run
+            print(f"  [teacher] could not record call: {e}", flush=True)
 
     def install(self):
         import google.adk.models.lite_llm as lm
@@ -117,6 +142,7 @@ class BudgetGuard:
                         yield chunk
                 return counted()
             guard.add(getattr(res, "usage", None))
+            guard.record(kw, res)
             return res
         lm.acompletion = acompletion
 
@@ -198,7 +224,7 @@ def main():
         from google.adk.models.lite_llm import LiteLlm
         key = os.environ.get("WANDB_API_KEY")
         assert key, "teacher mode needs WANDB_API_KEY in the environment"
-        guard = BudgetGuard(args.teacher, args.budget_usd, results / "teacher_spend.json")
+        guard = BudgetGuard(args.teacher, args.budget_usd, results / "teacher_spend.json", results / "model_calls.jsonl.gz")
         guard.install()
         install_litellm_reasoning_patch()
         registry = ModelRegistry()
