@@ -103,6 +103,39 @@ def load_model(path):
     return arch.from_pretrained(path, **kw)
 
 
+def _ce_sum(logits, target):
+    import torch
+    return torch.nn.functional.cross_entropy(logits.float(), target, reduction="sum")
+
+
+def loss_sum(model, d, chunk=1024):
+    """Summed loss over one conversation's trained tokens.
+
+    The fp32 copy of the logits (vocab 262k) for ~12k trained tokens is 12 GB, and cross-entropy keeps
+    another of the same size for backward; that is what ran 31B out of memory. Each chunk is
+    checkpointed, so only one chunk's fp32 logits exist at a time.
+    """
+    import torch
+    from torch.utils.checkpoint import checkpoint
+    ids = torch.tensor([d["input_ids"]], device="cuda")
+    lab = torch.tensor(d["labels"], device="cuda")
+    keep = (lab[1:] != -100).nonzero().squeeze(1)              # positions whose NEXT token is trained
+    logits = model(input_ids=ids, logits_to_keep=keep).logits[0]
+    target = lab[keep + 1]
+    return sum(checkpoint(_ce_sum, logits[s: s + chunk], target[s: s + chunk], use_reentrant=False)
+               for s in range(0, len(keep), chunk))
+
+
+def save_adapter(model, out, model_path):
+    out = Path(out)
+    model.save_pretrained(out)
+    cfg = json.loads((out / "adapter_config.json").read_text())
+    cfg["base_model_name_or_path"] = Path(model_path).name                # no local paths in the submission
+    (out / "adapter_config.json").write_text(json.dumps(cfg, indent=2))
+    print(f"saved {out}: " + ", ".join(f"{p.name} {p.stat().st_size / 1e6:.0f} MB" for p in sorted(out.iterdir())),
+          flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True)
@@ -118,6 +151,7 @@ def main():
     ap.add_argument("--max-len", type=int, default=32768)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--weight-decay", type=float, default=0.01)
+    ap.add_argument("--save-every", type=int, default=10, help="also save <out>_step<N> every N steps (0 = off)")
     args = ap.parse_args()
 
     tok = load_tokenizer(args.model)
@@ -167,14 +201,17 @@ def main():
     names = [n for n, p in model.named_parameters() if p.requires_grad]
     print("first LoRA weights:", names[:4], flush=True)
     model.train()                                              # gradient checkpointing only runs in train mode
-    if args.check_load:                                        # one real loss + backward on the longest example
-        d = max(data, key=lambda d: len(d["input_ids"]))
-        ids, lab = torch.tensor([d["input_ids"]], device="cuda"), torch.tensor(d["labels"], device="cuda")
-        keep = (lab[1:] != -100).nonzero().squeeze(1)
-        loss = torch.nn.functional.cross_entropy(model(input_ids=ids, logits_to_keep=keep).logits[0].float(), lab[keep + 1])
-        loss.backward()
-        print(f"check ok: {len(d['input_ids'])} tokens, loss {loss.item():.3f}, "
-              f"peak GPU memory {torch.cuda.max_memory_allocated() / 1e9:.1f} GB", flush=True)
+    if args.check_load:            # real loss + backward on the longest and on the most-trained-tokens example
+        n_lab_of = lambda d: sum(x != -100 for x in d["labels"])
+        for what, d in (("longest", max(data, key=lambda d: len(d["input_ids"]))), ("most trained", max(data, key=n_lab_of))):
+            torch.cuda.reset_peak_memory_stats()
+            loss = loss_sum(model, d)
+            loss.backward()
+            model.zero_grad(set_to_none=True)
+            print(f"check ok ({what}): {len(d['input_ids'])} tokens, {n_lab_of(d)} trained, "
+                  f"loss {loss.item() / n_lab_of(d):.3f}, peak GPU memory {torch.cuda.max_memory_allocated() / 1e9:.1f} GB",
+                  flush=True)
+            del loss
         return
 
     params = [p for p in model.parameters() if p.requires_grad]
@@ -196,30 +233,33 @@ def main():
     for k in range(0, len(order), args.accum):
         batch = [data[i] for i in order[k: k + args.accum]]
         n_batch = sum(sum(x != -100 for x in d["labels"]) for d in batch)   # token-weighted mean over the batch
-        loss_sum = 0.0
-        for d in batch:
-            ids = torch.tensor([d["input_ids"]], device="cuda")
-            lab = torch.tensor(d["labels"], device="cuda")
-            keep = (lab[1:] != -100).nonzero().squeeze(1)       # positions whose NEXT token is trained
-            out = model(input_ids=ids, logits_to_keep=keep)
-            logits = out.logits[0].float()
-            loss = torch.nn.functional.cross_entropy(logits, lab[keep + 1], reduction="sum") / n_batch
-            loss.backward()
-            loss_sum += loss.item()
-        torch.nn.utils.clip_grad_norm_(params, 1.0)
-        opt.step()
+        total_loss, oom = 0.0, False
+        try:
+            for d in batch:
+                loss = loss_sum(model, d) / n_batch
+                loss.backward()
+                total_loss += loss.item()
+                del loss
+        except torch.OutOfMemoryError:
+            oom = True                                          # cleaned up below, outside the except block
+        if oom:                                                 # drop this step's (partial) gradients, keep going
+            loss = None
+            opt.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            print(f"step {step + 1}/{total}: OUT OF MEMORY, step skipped", flush=True)
+        else:
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
         sched.step()
-        opt.zero_grad(set_to_none=True)
         step += 1
-        print(f"step {step}/{total} loss {loss_sum:.4f} lr {sched.get_last_lr()[0]:.2e} "
-              f"{(time.time() - t0) / 60:.1f} min", flush=True)
+        if not oom:
+            print(f"step {step}/{total} loss {total_loss:.4f} lr {sched.get_last_lr()[0]:.2e} "
+                  f"{(time.time() - t0) / 60:.1f} min | peak {torch.cuda.max_memory_allocated() / 1e9:.0f} GB", flush=True)
+        if args.save_every and step % args.save_every == 0 and step < total:
+            save_adapter(model, f"{args.out}_step{step}", args.model)
 
-    out = Path(args.out)
-    model.save_pretrained(out)
-    cfg = json.loads((out / "adapter_config.json").read_text())
-    cfg["base_model_name_or_path"] = Path(args.model).name                # no local paths in the submission
-    (out / "adapter_config.json").write_text(json.dumps(cfg, indent=2))
-    print(f"saved {out}: " + ", ".join(f"{p.name} {p.stat().st_size / 1e6:.0f} MB" for p in sorted(out.iterdir())))
+    save_adapter(model, args.out, args.model)
 
 
 if __name__ == "__main__":
